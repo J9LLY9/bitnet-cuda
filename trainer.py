@@ -44,7 +44,7 @@ class GradCkptBlock(nn.Module):
 # 1. ARGS  (parsed early so --resume_from is available before model init)
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--resume_from", type=str, default=None,
+parser.add_argument("--resume_from", type=str, default="BitNet_TS_1.27_Final.safetensors",
                     help="Path to a .safetensors checkpoint to resume from")
 args = parser.parse_args()
 
@@ -111,26 +111,26 @@ print(f"BitNet158 ready on {device} | grad-checkpointing ON | "
 # ---------------------------------------------------------------------------
 # 5. HYPERPARAMETERS
 # ---------------------------------------------------------------------------
-TOTAL_STEPS        = 6_000
+TOTAL_STEPS        = 50_000
 MICRO_BATCH        = 8      # forward-pass batch size
 ACCUM_STEPS        = 16     # 8 × 16 = 128 effective batch
-CKPT_EVERY         = 1_000  # fine-tune phase: less I/O, faster loop
-TARGET_LOSS        = 1.1    # auto-stop and save gold file when reached
+CKPT_EVERY         = 2_000  # weekend warrior: save every 2k steps
+TARGET_LOSS        = 1.05   # stretch goal: saves BITNET_1.05_HERO_WEIGHTS.safetensors
 DIVERGE_THRESHOLD  = 2.5    # emergency stop if loss spikes above this after step 100
 VRAM_MONITOR_STEPS = 50
 VRAM_LIMIT_GB      = 7.8
 vram_adapted       = False
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01,
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01,
                                betas=(0.9, 0.95))
 criterion = nn.CrossEntropyLoss(reduction="mean")
-scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_STEPS, eta_min=1e-6)
+scheduler = CosineAnnealingLR(optimizer, T_max=50_000, eta_min=1e-6)
 
 # ---------------------------------------------------------------------------
 # 6. DATA
 # ---------------------------------------------------------------------------
 def build_loader(batch_size: int):
-    raw = load_dataset("roneneldan/TinyStories", split="train[:25%]")
+    raw = load_dataset("roneneldan/TinyStories", split="train", keep_in_memory=True)
     def tokenize(batch):
         return tokenizer(batch["text"], padding="max_length",
                          truncation=True, max_length=MAX_SEQ_LEN)
@@ -147,7 +147,7 @@ def build_loader(batch_size: int):
 # 6b. LOG FILE  — opened in append + line-buffered mode so every line is
 #     flushed to disk immediately; safe to tail -f overnight_grind_log.txt
 # ---------------------------------------------------------------------------
-LOG_PATH = "overnight_grind_log.txt"
+LOG_PATH = "uw_application_grind.txt"
 _log_file = open(LOG_PATH, "a", buffering=1)
 
 import datetime as _dt
@@ -167,9 +167,10 @@ data_iter = build_loader(MICRO_BATCH)
 # ---------------------------------------------------------------------------
 log(f"Starting grind — {TOTAL_STEPS} steps on {device}")
 log(f"  Micro-batch  : {MICRO_BATCH}  (effective = {MICRO_BATCH * ACCUM_STEPS})")
-log(f"  LR           : 5e-5 → 1e-6  (CosineAnnealing — fine-tune phase)")
+log(f"  LR           : 1e-4 → 1e-6  (CosineAnnealing T_max=50,000 — Weekend Warrior)")
+log(f"  Weight decay : 0.01")
 log(f"  Ckpt every   : {CKPT_EVERY} steps  (.safetensors)")
-log(f"  Target loss  : {TARGET_LOSS}  → saves GOLD_1.1_SUCCESS.safetensors then exits")
+log(f"  Target loss  : {TARGET_LOSS}  → saves BITNET_1.05_HERO_WEIGHTS.safetensors then exits")
 log(f"  Diverge guard: loss > {DIVERGE_THRESHOLD} after step 100 → emergency stop")
 log(f"  Log file     : {LOG_PATH}")
 
@@ -229,8 +230,8 @@ while optimizer_step < TOTAL_STEPS:
     if avg_loss <= TARGET_LOSS:
         log(f"\n  TARGET REACHED — Loss {avg_loss:.4f} ≤ {TARGET_LOSS} at step {optimizer_step}")
         sd = {k: v.contiguous().float() for k, v in model.state_dict().items()}
-        st_save(sd, "GOLD_1.1_SUCCESS.safetensors")
-        log("  Saved: GOLD_1.1_SUCCESS.safetensors")
+        st_save(sd, "BITNET_1.05_HERO_WEIGHTS.safetensors")
+        log("  Saved: BITNET_1.05_HERO_WEIGHTS.safetensors")
         log("  Stopping training. The grind is over.")
         break
 
