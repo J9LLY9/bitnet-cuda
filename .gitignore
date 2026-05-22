@@ -6,3 +6,4 @@ venv_p520_new/
 .vscode/
 build/
 *.egg-info/
+*.so
