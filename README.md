@@ -60,7 +60,7 @@ independently on a Lenovo ThinkStation P520 running native Linux.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/J9LLY9/bitnet-custom-cuda.git
+git clone https://github.com/J9LLY9/bitnet-cuda.git
 cd bitnet-custom-cuda
 
 # 2. Setup the Python Virtual Environment
