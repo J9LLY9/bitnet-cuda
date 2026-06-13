@@ -36,8 +36,21 @@ def run_benchmark(M, K, N, mode="Inference"):
     A = torch.randn(M, K, dtype=torch.float16, device="cuda")
     B_fp16 = torch.randn(N, K, dtype=torch.float16, device="cuda")
     
-    # For custom kernel: Packed int8 weights (N, K/4)
-    B_packed = torch.randint(-128, 127, (N, K // 4), dtype=torch.int8, device="cuda")
+    # For custom kernel: Packed int8 weights, pre-transposed for coalesced access (v4).
+    #
+    # The kernel reads B_u4[t * N + g_col]:
+    #   t     = tile index  ∈ [0, K//64)  — outer dimension
+    #   g_col = neuron index ∈ [0, N)     — inner / fast dimension
+    # so consecutive threads (consecutive g_col) hit consecutive addresses.
+    #
+    # Step 1: create a random (N, K//4) int8 weight matrix (the logical layout).
+    # Step 2: view as (N, K//64, 16) — splits K//4 bytes into (K//64 tiles, 16 bytes/tile).
+    # Step 3: permute to (K//64, N, 16) — tile first, neuron second.
+    # Step 4: .contiguous() — materialises the transposed layout in physical memory.
+    B_packed = (torch.randint(-128, 127, (N, K // 4), dtype=torch.int8, device="cuda")
+                    .view(N, K // 64, 16)
+                    .permute(1, 0, 2)
+                    .contiguous())
 
     # Define the functions
     def pytorch_baseline():

@@ -94,7 +94,7 @@ def test_fixed():
     print("TEST 1 — Fixed hand-crafted values")
     print("=" * 60)
 
-    M, K, N = 1, 4, 2
+    M, K, N = 1, 64, 2
 
     A_vals = torch.tensor([[1.0, 0.0, -1.0, 2.0]], dtype=torch.float16, device="cuda")
     W_int  = torch.tensor([[1,  1,  0, 0],

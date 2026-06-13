@@ -1,9 +1,9 @@
 import time
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import gradio as gr
 from transformers import AutoTokenizer
+from model import BitNet158, get_device
 
 try:
     import pynvml
@@ -13,117 +13,75 @@ try:
 except Exception:
     NVML_OK = False
 
-# ---------------------------------------------------------------------------
-# Architecture (must match trainer.py exactly)
-# ---------------------------------------------------------------------------
-class BitLinear(nn.Linear):
-    def forward(self, x):
-        w = self.weight
-        gamma = w.abs().mean()
-        w_quant = (w / (gamma + 1e-5)).round().clamp(-1, 1)
-        w_final = w + (w_quant - w).detach()
-        return F.linear(x, w_final, self.bias) * gamma
-
-
-class BitAttention(nn.Module):
-    def __init__(self, embed_size, num_heads):
-        super().__init__()
-        assert embed_size % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim  = embed_size // num_heads
-        self.W_q = BitLinear(embed_size, embed_size)
-        self.W_k = BitLinear(embed_size, embed_size)
-        self.W_v = BitLinear(embed_size, embed_size)
-        self.W_o = BitLinear(embed_size, embed_size)
-
-    def forward(self, x, mask):
-        B, T, C = x.shape
-        Q = self.W_q(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.W_k(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.W_v(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        scale = self.head_dim ** -0.5
-        attn  = (Q @ K.transpose(-2, -1)) * scale
-        attn  = attn.masked_fill(mask == 0, float("-inf"))
-        attn  = F.softmax(attn, dim=-1)
-        out   = attn @ V
-        out   = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.W_o(out)
-
-
-class BitBlock(nn.Module):
-    def __init__(self, embed_size, num_heads):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(embed_size)
-        self.attention = BitAttention(embed_size, num_heads)
-        self.norm2 = nn.LayerNorm(embed_size)
-        self.ffn = nn.Sequential(
-            BitLinear(embed_size, 4 * embed_size),
-            nn.ReLU(),
-            BitLinear(4 * embed_size, embed_size),
-        )
-
-    def forward(self, x, mask):
-        x = x + self.attention(self.norm1(x), mask)
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
-class BitNetLanguageModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads=8, num_layers=12, max_seq_len=256):
-        super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, embed_size)
-        self.pos_embedding   = nn.Embedding(max_seq_len, embed_size)
-        self.blocks  = nn.ModuleList([BitBlock(embed_size, num_heads) for _ in range(num_layers)])
-        self.norm    = nn.LayerNorm(embed_size)
-        self.lm_head = BitLinear(embed_size, vocab_size)
-
-    def forward(self, x):
-        B, T = x.shape
-        positions = torch.arange(T, device=x.device).unsqueeze(0)
-        x    = self.token_embedding(x) + self.pos_embedding(positions)
-        mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
-        for block in self.blocks:
-            x = block(x, mask)
-        return self.lm_head(self.norm(x))
-
 
 # ---------------------------------------------------------------------------
 # Model loading — prefers SFT weights/tokenizer when available
 # ---------------------------------------------------------------------------
 import os
+import re
+import glob
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+device = str(get_device())
 
 SFT_TOKENIZER_DIR = "sft_tokenizer"
 SFT_WEIGHTS       = "bitnet_sft.pt"
 BASE_WEIGHTS      = "bitnet_weights.pt"
+SAFETENSORS_CANDIDATES = [
+    "BitNet_UW_Final_Gold_1.04.safetensors",
+    "BITNET_1.05_HERO_WEIGHTS.safetensors",
+    "bitnet_weights_final.safetensors",
+]
+
+def _find_weights():
+    """Return (path, is_safetensors) for the best available checkpoint."""
+    if os.path.isdir(SFT_TOKENIZER_DIR) and os.path.isfile(SFT_WEIGHTS):
+        return SFT_WEIGHTS, False
+    if os.path.isfile(BASE_WEIGHTS):
+        return BASE_WEIGHTS, False
+    for name in SAFETENSORS_CANDIDATES:
+        if os.path.isfile(name):
+            return name, True
+    ckpts = sorted(glob.glob("checkpoint_step*.safetensors"))
+    if ckpts:
+        return ckpts[-1], True
+    return None, False
+
+def _load_weights(model, path, is_safetensors, device):
+    if is_safetensors:
+        from safetensors.torch import load_file as st_load
+        ckpt = st_load(path, device=device)
+        ckpt = {re.sub(r'^(blocks\.\d+)\.block\.', r'\1.', k): v for k, v in ckpt.items()}
+        model.load_state_dict(ckpt, strict=True)
+    else:
+        model.load_state_dict(torch.load(path, map_location=device))
 
 if os.path.isdir(SFT_TOKENIZER_DIR):
-    tokenizer    = AutoTokenizer.from_pretrained(SFT_TOKENIZER_DIR)
-    weights_path = SFT_WEIGHTS
-    model_label  = "SFT · Ternary 1.58-bit · 12L · 512d"
+    tokenizer   = AutoTokenizer.from_pretrained(SFT_TOKENIZER_DIR)
+    model_label = "SFT · Ternary 1.58-bit · 12L · 512d"
     print(f"SFT tokenizer loaded from {SFT_TOKENIZER_DIR}/")
 else:
-    tokenizer    = AutoTokenizer.from_pretrained("gpt2")
-    weights_path = BASE_WEIGHTS
-    model_label  = "Pre-trained · Ternary 1.58-bit · 12L · 512d"
+    tokenizer   = AutoTokenizer.from_pretrained("gpt2")
+    model_label = "Pre-trained · Ternary 1.58-bit · 12L · 512d"
 
 tokenizer.pad_token = tokenizer.eos_token
 vocab_size = len(tokenizer)   # includes any added special tokens
 
-model = BitNetLanguageModel(vocab_size, embed_size=512, num_heads=8, num_layers=12).to(device)
-try:
-    model.load_state_dict(torch.load(weights_path, map_location=device))
-    print(f"Weights loaded from {weights_path}")
-except FileNotFoundError:
-    print(f"WARNING: {weights_path} not found — running with random weights.")
+model = BitNet158(vocab_size, embed_size=512, num_heads=8, num_layers=12, max_seq_len=256).to(device)
+
+weights_path, is_st = _find_weights()
+if weights_path is None:
+    print("WARNING: no weights found — running with random weights.")
     model_label = "RANDOM INIT — no weights found"
-except RuntimeError as e:
-    raise RuntimeError(
-        f"Architecture mismatch loading {weights_path} — "
-        "check that num_layers/embed_size match the checkpoint.\n"
-        f"Original error: {e}"
-    )
+else:
+    try:
+        _load_weights(model, weights_path, is_st, device)
+        print(f"Weights loaded from {weights_path}")
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Architecture mismatch loading {weights_path} — "
+            "check that num_layers/embed_size match the checkpoint.\n"
+            f"Original error: {e}"
+        )
 model.eval()
 
 

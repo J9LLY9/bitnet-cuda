@@ -10,13 +10,15 @@
 typedef float half;
 #endif
 /*
- * bitnet_forward.cu  —  v3: Vectorized uint4 Memory Access
+ * bitnet_forward.cu  —  v6: Branchless Ternary Accumulation (no FMUL)
  *
- * Matrix layout (unchanged from v2)
+ * Matrix layout
  * -----------------------------------
- *   A         : (M, K)   fp16   — input activations (RMSNorm'd)
- *   B_packed  : (N, K/4) int8   — ternary weights, 4 per byte, 2 bits each
- *   C         : (M, N)   fp16   — output
+ *   A         : (M, K)          fp16   — input activations (RMSNorm'd)
+ *   B_packed  : (K/64, N, 16)   int8   — ternary weights, transposed for
+ *                                        coalesced access (see "What changed"
+ *                                        below); logically (K_u4, N) uint4
+ *   C         : (M, N)          fp16   — output
  *
  * Ternary encoding (2 bits per weight, LSB-first within each byte)
  * -----------------------------------------------------------------
@@ -33,8 +35,49 @@ typedef float half;
  *       single 16-byte __ldg load (1 uint4 = 64 2-bit ternary weights).
  *       Per cache-line transaction:  16 B useful  /  128 B fetched ≈ 12.5%.
  *
- *   BLOCK_K raised 16 → 64 to match the natural uint4 width:
+ *       BLOCK_K raised 16 → 64 to match the natural uint4 width:
  *       16 bytes × 4 weights/byte = 64 ternary weights per tile slice.
+ *
+ *   v4: Transposed B layout + coalesced B load.
+ *       v3's formula B_u4[g_col * K_u4 + t] strides consecutive threads by
+ *       K_u4 uint4 elements (= K/4 bytes) in memory — the GPU sees N
+ *       independent cache lines per warp, giving ~0.53% bandwidth utilisation.
+ *
+ *       Fix: Python pre-packs B into physical layout (K_u4, N, 16 bytes) so
+ *       that tile t is the outer dimension and the neuron index n is inner.
+ *       The kernel now reads B_u4[t * N + g_col]: consecutive threads
+ *       (consecutive g_col / tx values) hit consecutive uint4 addresses
+ *       → one 128-byte cache line serves all 8 threads in a warp sub-group
+ *       → 100% coalesced LDG, theoretical 12.5× bandwidth gain over v3.
+ *
+ *   v5: Shared Memory Unpacking Station — eliminates redundant decode work.
+ *       In v4, every one of the 16 ty-rows in a block decoded the same uint4
+ *       bucket for its output column: 16× redundant bitwise shifts/masks per
+ *       tile step, making the kernel compute-bound on bitwise instructions
+ *       during prefill (M = 1024, many warps active).
+ *
+ *       Fix: only ty == 0 (16 threads) decodes the uint4.  It writes 64 fp16
+ *       scalars {-1, 0, +1} into s_B_unpacked[tx][0..63] (the "Unpacking
+ *       Station").  After __syncthreads(), all 16 ty-rows read the decoded
+ *       weights via cheap LDS and execute a branchless 64-iteration FMA loop.
+ *       Decode work: 16× reduction.  Compute path: scalar FP16 MACs, no
+ *       branches, fully pipelined by the hardware scheduler.
+ *
+ *   v6: Branchless Ternary Accumulation — eliminates all FMUL from inner loop.
+ *       v5's Phase 2 still used  acc += half2float(A) * half2float(B)  where B
+ *       is always -1, 0, or +1.  That multiply violates the BitNet b1.58 thesis
+ *       and wastes an FMUL instruction on every one of the 64 inner iterations.
+ *
+ *       Fix: s_B_unpacked retyped from __half to int8_t.  The unpack station
+ *       writes raw {-1, 0, +1} integers instead of fp16 floats.  Phase 2 reads
+ *       the weight as int8_t and uses a branchless conditional select:
+ *           acc += (w == 1) ? a : (w == -1) ? -a : 0.0f;
+ *       The compiler emits ISETP + FSEL — one predicate, one select — per
+ *       iteration.  Zero FMUL, zero warp divergence.
+ *       Trade-off: int8_t elements are 1 byte vs 2 for __half, so s_B_unpacked
+ *       reads have 4-way bank conflicts instead of 2-way.  Acceptable: the FMUL
+ *       elimination on 64 iterations dominates, and the layout is replaced in
+ *       the ISSUE-05 __dp4a migration regardless.
  *
  * Grid / Block dimensions — UNCHANGED from v2
  * --------------------------------------------
@@ -43,15 +86,15 @@ typedef float half;
  *
  * Shared memory per block
  * -----------------------
- *   s_A     : 16 × 64 × 2 B (fp16 tile)  = 2048 B
- *   s_B_u4  : 16 × 16 B   (uint4 tile)   =  256 B
- *   total                                 = 2304 B  ← well under 48 KB / SM
+ *   s_A           : 16 × 66 × 2 B  (fp16 activation tile, +2 pad) = 2112 B
+ *   s_B_unpacked  : 64 × 16 × 1 B  (int8 decoded weight tile)    = 1024 B
+ *   total                                                         = 3136 B  ← well under 48 KB / SM
  *
  * Theoretical occupancy (GA107 / RTX 3050, Ampere sm_86)
  * -------------------------------------------------------
- *   Shared-memory limit  : 48 KB / 2304 B ≈ 21 blocks max
- *   Thread limit         : 2048  / 256     =  8 blocks max  ← binding
- *   → 8 blocks × 256 = 2048 threads = 100 % theoretical occupancy (same as v2)
+ *   Shared-memory limit  : 48 KB / 3136 B = 15 blocks max
+ *   Thread limit         : 2048  / 256    =  8 blocks max  ← binding (unchanged)
+ *   → 8 blocks × 256 = 2048 threads = 100 % theoretical occupancy
  *
  * uint4 alignment
  * ---------------
@@ -91,7 +134,7 @@ typedef float half;
 //                       threads / SM simultaneously.
 __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
     const __half *__restrict__ A,        // (M, K)    row-major fp16
-    const int8_t *__restrict__ B_packed, // (N, K/4)  row-major, packed ternary
+    const int8_t *__restrict__ B_packed, // (K/64, N, 16)  pre-packed ternary (v4 transpose)
     __half *__restrict__ C,              // (M, N)    row-major fp16 output
     int M, int K, int N) {
   const int ty = threadIdx.y;
@@ -106,12 +149,15 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
 
   // ------------------------------------------------------------------
   // Shared memory
-  //   s_A     : fp16 activation tile  — BLOCK rows × BLOCK_K cols
-  //   s_B_u4  : ternary weight tile   — one uint4 (64 weights) per
-  //             output column in this block (BLOCK entries total)
+  //   s_A          : fp16 activation tile   — BLOCK rows  × (BLOCK_K + 2) cols (padded)
+  //   s_B_unpacked : fp16 decoded weight tile — BLOCK_K rows × BLOCK cols
+  //
+  //   s_B_unpacked[i][tx] = pre-decoded weight scalar {-1,0,+1} as __half
+  //   for output column `tx` at K-offset `i` within the current tile.
+  //   Written once by ty==0; read by all ty rows in Phase 2.
   // ------------------------------------------------------------------
-  __shared__ __half s_A[BLOCK][BLOCK_K]; // 2048 bytes
-  __shared__ uint4 s_B_u4[BLOCK];        //  256 bytes
+  __shared__ __half  s_A[BLOCK][BLOCK_K + 2];      // 2112 bytes — activation tile (padded to avoid 2-way bank conflict)
+  __shared__ int8_t  s_B_unpacked[BLOCK_K][BLOCK]; // 1024 bytes — Unpacking Station (int8 ternary: -1, 0, +1)
 
   float acc = 0.0f;
 
@@ -151,92 +197,73 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
           (row < M && k_a < K) ? __ldg(&A[row * K + k_a]) : __float2half(0.0f);
     }
 
-    // --- Load s_B_u4 (ternary weight tile) — vectorized uint4 ---
+    // --- Fetch + Unpack: global B → s_B_unpacked (Shared Memory Unpacking Station) ---
     //
-    // We need exactly BLOCK (16) uint4 values: one per output column in
-    // this block.  Only the BLOCK threads with ty == 0 participate;
-    // the remaining 240 threads are idle during this phase (the B tile
-    // is tiny — 256 bytes — so the latency is hidden by the A load above,
-    // which all 256 threads issued in parallel through the __ldg cache).
+    // Only ty == 0 (16 threads, one per output column in this block) participates.
+    // Each thread:
+    //   1. Issues ONE coalesced __ldg for its output column's uint4 (unchanged
+    //      from v4: B_packed layout is (K_u4, N) uint4, so consecutive tx values
+    //      map to consecutive addresses → fully coalesced 256-byte transaction).
+    //   2. Unpacks the 4 × uint32 chunks into 64 fp16 scalars {-1, 0, +1} and
+    //      writes them to s_B_unpacked[0..63][tx].
     //
-    // Thread (ty=0, tx):
-    //   g_col = blockIdx.x * 16 + tx        — global output column
-    //   loads 16 contiguous bytes from row g_col of B_packed, at the
-    //   uint4 offset for this tile (t), covering 64 ternary weights:
-    //     B_packed[ g_col * (K/4) + t*16 ]  …  [ + 15 ]
+    // The 240 ty > 0 threads are idle here, but the latency is hidden by the
+    // s_A load above which all 256 threads issued through the __ldg cache.
     //
-    // The 16 threads access 16 different rows of B_packed — these are
-    // strided by K/4 bytes in global memory.  Each individual uint4 load
-    // still brings in 16 bytes of *useful* data per 128-byte cache line
-    // (12.5% efficiency), vs. 1 byte per cache line (0.78%) in v2.
+    // After __syncthreads() every ty row reads the decoded weights via cheap LDS
+    // in Phase 2 — decode cost drops from 16× (v4) to 1× per tile step.
     if (ty == 0) {
-      const int g_col = blockIdx.x * BLOCK + tx; // global output col
-      s_B_u4[tx] = (g_col < N) ? __ldg(&B_u4[g_col * K_u4 + t])
-                               : make_uint4(0u, 0u, 0u, 0u);
+      const int g_col = blockIdx.x * BLOCK + tx;
+      const uint4 bw = (g_col < N) ? __ldg(&B_u4[t * N + g_col])
+                                   : make_uint4(0u, 0u, 0u, 0u);
+
+      // Unpack 4 chunks × 16 codes = 64 ternary weights into s_B_unpacked.
+      // After #pragma unroll, c is a compile-time constant (0/1/2/3), so the
+      // ternary chain collapses to one of bw.x/y/z/w with zero runtime cost.
+      // The inner index (c * 16 + i) is also compile-time-constant → nvcc emits
+      // STS with a literal byte offset (no runtime address arithmetic).
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const uint32_t chunk = (c == 0)   ? bw.x
+                               : (c == 1) ? bw.y
+                               : (c == 2) ? bw.z
+                                          : bw.w;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          const unsigned code = (chunk >> (i * 2)) & 0x3u;
+          // Encoding: 0b00 → 0, 0b01 → +1, 0b10 → -1, 0b11 → -1 (undefined).
+          s_B_unpacked[c * 16 + i][tx] = (code == 1u) ? (int8_t) 1
+                                       : (code == 2u) ? (int8_t)-1
+                                                      : (int8_t) 0;
+        }
+      }
     }
 
     // All threads must finish loading before any thread reads shared memory.
     __syncthreads();
 
     // ==================================================================
-    // Phase 2 — Compute: dot product from shared memory
+    // Phase 2 — Compute: branchless ternary accumulation (no FMUL)
     // ==================================================================
     //
-    // Only live output threads accumulate; idle threads keep acc == 0
-    // and the store below is skipped for them.
+    // s_B_unpacked[i][tx] holds the pre-decoded int8 weight {-1, 0, +1}
+    // for output column tx and K-offset i, written by ty==0 above.
+    //
+    // ALL threads (ty 0–15) execute a flat, 64-wide branchless select loop:
+    //   w  = int8 weight:  -1, 0, or +1
+    //   a  = float activation
+    //   acc += (w == 1) ? a : (w == -1) ? -a : 0.0f
+    //
+    // The compiler emits ISETP (integer set predicate) + FSEL (float select)
+    // per iteration — no FMUL, no branch, zero warp divergence.
+    // All threads evaluate the same instruction sequence; the hardware routes
+    // each thread's predicate independently based on its own w value.
     if (row < M && col < N) {
-
-      // Fetch this output column's packed weights from shared memory.
-      // s_B_u4[tx] is broadcast to all ty-rows in the block (same tx).
-      // uint4 layout:
-      //   .x  →  weights for K-offsets  0 .. 15  (bits  0..31)
-      //   .y  →  weights for K-offsets 16 .. 31  (bits  0..31)
-      //   .z  →  weights for K-offsets 32 .. 47  (bits  0..31)
-      //   .w  →  weights for K-offsets 48 .. 63  (bits  0..31)
-      const uint4 bw = s_B_u4[tx];
-
-      // The four 32-bit chunks are named explicitly to ensure nvcc keeps
-      // them in registers and does not spill a runtime-indexed array.
-      const uint32_t chunk0 =
-          bw.x; // K-offsets  0..15  (2 bits each, LSB-first)
-      const uint32_t chunk1 = bw.y; // K-offsets 16..31
-      const uint32_t chunk2 = bw.z; // K-offsets 32..47
-      const uint32_t chunk3 = bw.w; // K-offsets 48..63
-
-// Fully unrolled decode-and-accumulate: 4 chunks × 16 weights = 64 MACs.
-//
-// KEY OPTIMISATION — compile-time-constant s_A index:
-//   After #pragma unroll expands both loops, c and i are literal
-//   integers.  The expression (c * 16 + i) therefore folds to a
-//   single constant at compile time, and nvcc emits an LDS with a
-//   constant byte offset — zero runtime arithmetic on the s_A address.
-//
-// Branch strategy — skip zero and undefined weights:
-//   code 0 (0b00) → weight  0  → no contribution
-//   code 1 (0b01) → weight +1  → add activation
-//   code 2 (0b10) → weight -1  → subtract activation
-//   code 3 (0b11) → undefined  → treated as -1  (matches v2 behaviour;
-//                                real BitNet-1.58b weights never use this)
-//   Branching on (code != 0) skips the ~25% zero weights in real models,
-//   reducing total FMAs.  With --use_fast_math the branch overhead is
-//   negligible when the branch is mostly coherent within a warp.
 #pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        // After unrolling, c is a compile-time constant (0/1/2/3) so this
-        // ternary chain reduces to one of chunk0/1/2/3 with no runtime cost.
-        const uint32_t chunk = (c == 0)   ? chunk0
-                               : (c == 1) ? chunk1
-                               : (c == 2) ? chunk2
-                                          : chunk3;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          const unsigned code = (chunk >> (i * 2)) & 0x3u;
-          if (code != 0u) {
-            // (c * 16 + i) is a compile-time constant — constant LDS offset.
-            const float a = __half2float(s_A[ty][c * 16 + i]);
-            acc += (code == 1u) ? a : -a;
-          }
-        }
+      for (int i = 0; i < BLOCK_K; ++i) {
+        const int8_t w = s_B_unpacked[i][tx];
+        const float  a = __half2float(s_A[ty][i]);
+        acc += (w == 1) ? a : (w == -1) ? -a : 0.0f;
       }
     } // end if (row < M && col < N)
 
@@ -252,8 +279,8 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
 // ---------------------------------------------------------------------------
 // Host-side C++ wrapper
 // ---------------------------------------------------------------------------
-torch::Tensor bitnet_forward(torch::Tensor A,        // (M, K) float16, CUDA
-                             torch::Tensor B_packed, // (N, K/4) int8,  CUDA
+torch::Tensor bitnet_forward(torch::Tensor A,        // (M, K)        float16, CUDA
+                             torch::Tensor B_packed, // (K/64, N, 16) int8,  CUDA (pre-packed, see v5 notes)
                              int M, int K, int N) {
   TORCH_CHECK(A.is_cuda(), "A must be on a CUDA device");
   TORCH_CHECK(B_packed.is_cuda(), "B_packed must be on a CUDA device");
@@ -262,11 +289,11 @@ torch::Tensor bitnet_forward(torch::Tensor A,        // (M, K) float16, CUDA
   TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
   TORCH_CHECK(B_packed.is_contiguous(), "B_packed must be contiguous");
 
-  // v3 requires K % 64 == 0:
+  // v5 requires K % 64 == 0:
   //   uint4 = 16 bytes = 64 ternary weights.
   //   Standard BitNet dims (256, 512, 1024, 2048, 4096 …) all satisfy this.
   TORCH_CHECK(K % 64 == 0,
-              "v3 vectorized kernel requires K divisible by 64 "
+              "v5 smem-unpacking kernel requires K divisible by 64 "
               "(one uint4 = 16 bytes = 64 packed 2-bit weights). "
               "Got K=",
               K, ". Pad your weight matrix to the next multiple of 64.");
@@ -295,7 +322,9 @@ torch::Tensor bitnet_forward(torch::Tensor A,        // (M, K) float16, CUDA
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bitnet_forward", &bitnet_forward,
-        "BitNet-1.58b uint4-vectorized ternary-weight forward pass (v3).\n"
-        "Args: A (M,K fp16), B_packed (N,K/4 int8), M, K, N -> C (M,N fp16)\n"
+        "BitNet-1.58b Branchless Ternary Accumulation forward pass (v6).\n"
+        "Args: A (M,K fp16), B_packed (K/64,N,16 int8 pre-packed), M, K, N -> C (M,N fp16)\n"
+        "B_packed must be pre-transposed in Python: view(N,K//64,16).permute(1,0,2).contiguous()\n"
+        "ty==0 decodes uint4 → int8 {-1,0,+1} weights into smem; all ty rows do branchless ISETP+FSEL.\n"
         "Requires: K % 64 == 0  (one uint4 = 16 bytes = 64 2-bit weights).");
 }
