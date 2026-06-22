@@ -47,6 +47,11 @@ def pack_ternary(W_int: torch.Tensor) -> torch.Tensor:
     return packed
 
 
+def apply_kernel_layout(B_packed: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Transpose packed weights into the tiled layout expected by kernel v6."""
+    return B_packed.view(N, K // 64, 16).permute(1, 0, 2).contiguous()
+
+
 def unpack_ternary(B_packed: torch.Tensor, K: int) -> torch.Tensor:
     """
     Inverse of pack_ternary. Returns a (N, K) float32 weight matrix.
@@ -83,8 +88,8 @@ def test_fixed():
     """
     Tiny hand-crafted case where we can reason about every number.
 
-    A   = [[1, 0, -1, 2]]   shape (1, 4)  — one input row, 4 features
-    W   = [[1, 1,  0, 0],   shape (2, 4)  — two output neurons
+    A   = [[1, 0, -1, 2, 0, ...]]   shape (1, 64)
+    W   = [[1, 1,  0, 0, 0, ...],   shape (2, 64)
            [0, 1, -1, 1]]
     C   = A @ W^T
         row 0 = [1*1+0*1+(-1)*0+2*0,  1*0+0*1+(-1)*(-1)+2*1]
@@ -96,10 +101,12 @@ def test_fixed():
 
     M, K, N = 1, 64, 2
 
-    A_vals = torch.tensor([[1.0, 0.0, -1.0, 2.0]], dtype=torch.float16, device="cuda")
-    W_int  = torch.tensor([[1,  1,  0, 0],
-                           [0,  1, -1, 1]], dtype=torch.int8)
-    B_packed = pack_ternary(W_int).cuda()
+    A_vals = torch.zeros((M, K), dtype=torch.float16, device="cuda")
+    A_vals[:, :4] = torch.tensor([[1.0, 0.0, -1.0, 2.0]], dtype=torch.float16, device="cuda")
+    W_int = torch.zeros((N, K), dtype=torch.int8)
+    W_int[:, :4] = torch.tensor([[1,  1,  0, 0],
+                                 [0,  1, -1, 1]], dtype=torch.int8)
+    B_packed = apply_kernel_layout(pack_ternary(W_int), N, K).cuda()
 
     C_kernel = bitnet_cuda.bitnet_forward(A_vals, B_packed, M, K, N)
     C_ref    = torch.tensor([[1.0, 3.0]], dtype=torch.float16)
@@ -132,13 +139,16 @@ def test_random(M=64, K=128, N=64, seed=42):
 
     # Random ternary weights drawn from {-1, 0, +1} with roughly 50% zeros
     W_int    = torch.randint(-1, 2, (N, K), dtype=torch.int8)   # uniform {-1,0,+1}
-    B_packed = pack_ternary(W_int).cuda()
+    B_packed = pack_ternary(W_int)
+
+    # Reference uses the canonical (N, K/4) packing; v6 uses tiled layout.
+    W_float = unpack_ternary(B_packed, K)
+    B_packed = apply_kernel_layout(B_packed, N, K).cuda()
 
     # Kernel output
     C_kernel = bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
 
     # Reference: unpack weights, do fp32 matmul, store as fp16
-    W_float = unpack_ternary(B_packed, K)
     C_ref   = reference_matmul(A_fp16, W_float)
 
     # fp16 accumulation can drift; allow a small absolute tolerance.
@@ -162,7 +172,7 @@ def test_random(M=64, K=128, N=64, seed=42):
         sys.exit(1)
 
 
-def test_boundary(M=17, K=48, N=33, seed=7):
+def test_boundary(M=17, K=128, N=33, seed=7):
     """
     Non-power-of-two shapes that stress the tile boundary handling.
     M=17 and N=33 are not multiples of BLOCK=16, so the last tile column/row
@@ -176,10 +186,11 @@ def test_boundary(M=17, K=48, N=33, seed=7):
 
     A_fp16   = (torch.rand(M, K, dtype=torch.float32) * 2 - 1).half().cuda()
     W_int    = torch.randint(-1, 2, (N, K), dtype=torch.int8)
-    B_packed = pack_ternary(W_int).cuda()
+    B_packed = pack_ternary(W_int)
+    W_float = unpack_ternary(B_packed, K)
+    B_packed = apply_kernel_layout(B_packed, N, K).cuda()
 
     C_kernel = bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
-    W_float  = unpack_ternary(B_packed, K)
     C_ref    = reference_matmul(A_fp16, W_float)
 
     max_err = (C_kernel.cpu() - C_ref).abs().max().item()
@@ -192,7 +203,7 @@ def test_boundary(M=17, K=48, N=33, seed=7):
         sys.exit(1)
 
 
-def test_all_zero_weights(M=16, K=16, N=16):
+def test_all_zero_weights(M=16, K=64, N=16):
     """
     All weights zero → C must be all zeros regardless of A.
     Verifies that the 'skip zero' branch doesn't accidentally accumulate.
@@ -203,7 +214,7 @@ def test_all_zero_weights(M=16, K=16, N=16):
 
     A_fp16   = torch.randn(M, K, dtype=torch.float16, device="cuda")
     W_int    = torch.zeros(N, K, dtype=torch.int8)
-    B_packed = pack_ternary(W_int).cuda()
+    B_packed = apply_kernel_layout(pack_ternary(W_int), N, K).cuda()
 
     C_kernel = bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
 
@@ -280,12 +291,13 @@ def benchmark(M: int = 4096, K: int = 4096, N: int = 4096,
 
     # Ternary weight matrix {-1, 0, +1} — same weights used everywhere.
     W_int    = torch.randint(-1, 2, (N, K), dtype=torch.int8)
-    B_packed = pack_ternary(W_int).cuda()
+    B_packed = pack_ternary(W_int)
 
     # Unpacked fp16 and fp32 weight matrices for the PyTorch baselines.
     # unpack_ternary() returns float32; casting to fp16 matches nn.Linear input.
     W_f32 = unpack_ternary(B_packed, K).cuda()   # (N, K)
     W_f16 = W_f32.half()
+    B_packed = apply_kernel_layout(B_packed, N, K).cuda()
 
     # ── PyTorch fp16 baseline (cuBLAS + Tensor Cores) ───────────────────────
 
@@ -368,9 +380,10 @@ def benchmark_sweep() -> None:
         A_fp16   = (torch.rand(M, K) * 4 - 2).half().cuda()
         A_fp32   = A_fp16.float()
         W_int    = torch.randint(-1, 2, (N, K), dtype=torch.int8)
-        B_packed = pack_ternary(W_int).cuda()
+        B_packed = pack_ternary(W_int)
         W_f32    = unpack_ternary(B_packed, K).cuda()
         W_f16    = W_f32.half()
+        B_packed = apply_kernel_layout(B_packed, N, K).cuda()
 
         iters = 200 if M <= 32 else 50
 

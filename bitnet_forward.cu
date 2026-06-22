@@ -137,6 +137,9 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
     const int8_t *__restrict__ B_packed, // (K/64, N, 16)  pre-packed ternary (v4 transpose)
     __half *__restrict__ C,              // (M, N)    row-major fp16 output
     int M, int K, int N) {
+  if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+      printf("KERNEL IS RUNNING\n");
+  }
   const int ty = threadIdx.y;
   const int tx = threadIdx.x;
   const int row = blockIdx.y * BLOCK + ty; // global output row  [0, M)
