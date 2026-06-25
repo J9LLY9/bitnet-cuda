@@ -147,7 +147,7 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
   //   s_B_unpacked : int8 decoded weight tile — BLOCK_K rows × BLOCK cols
   // ------------------------------------------------------------------
   __shared__ int8_t  s_A[BLOCK][BLOCK_K];           // 1024 bytes — activation tile
-  __shared__ int8_t  s_B_unpacked[BLOCK_K][BLOCK]; // 1024 bytes — Unpacking Station (int8 ternary: -1, 0, +1)
+  __shared__ int32_t s_B_packed[BLOCK_K / 4][BLOCK]; // 1024 bytes — packed decoded weights (4 x int8 in int32)
 
   int acc = 0;
 
@@ -219,12 +219,18 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
                                : (c == 2) ? bw.z
                                           : bw.w;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          const unsigned code = (chunk >> (i * 2)) & 0x3u;
-          // Encoding: 0b00 → 0, 0b01 → +1, 0b10 → -1, 0b11 → -1 (undefined).
-          s_B_unpacked[c * 16 + i][tx] = (code == 1u) ? (int8_t) 1
-                                       : (code == 2u) ? (int8_t)-1
-                                                      : (int8_t) 0;
+        for (int g = 0; g < 4; ++g) {
+          int32_t packed_val = 0;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const unsigned code = (chunk >> ((g * 4 + i) * 2)) & 0x3u;
+            // Encoding: 0b00 → 0, 0b01 → +1, 0b10 → -1, 0b11 → -1 (undefined).
+            int8_t w = (code == 1u) ? (int8_t) 1
+                     : (code == 2u) ? (int8_t)-1
+                                    : (int8_t) 0;
+            packed_val |= ((int32_t)w & 0xFF) << (i * 8);
+          }
+          s_B_packed[c * 4 + g][tx] = packed_val;
         }
       }
     }
@@ -244,12 +250,9 @@ __global__ __launch_bounds__(BLOCK *BLOCK, 4) void bitnet_forward_kernel(
     // where a and b are reinterpreted as 4 × int8 packed in int32.
     if (row < M && col < N) {
 #pragma unroll
-      for (int k = 0; k < BLOCK_K; k += 4) {
-        int a_val = *reinterpret_cast<const int*>(&s_A[ty][k]);
-        int b_val = ((int)(s_B_unpacked[k + 0][tx]) & 0xFF)
-                  | (((int)(s_B_unpacked[k + 1][tx]) & 0xFF) <<  8)
-                  | (((int)(s_B_unpacked[k + 2][tx]) & 0xFF) << 16)
-                  | (((int)(s_B_unpacked[k + 3][tx]) & 0xFF) << 24);
+      for (int k = 0; k < BLOCK_K / 4; ++k) {
+        int a_val = reinterpret_cast<const int*>(s_A[ty])[k];
+        int b_val = s_B_packed[k][tx];
         acc = __dp4a(a_val, b_val, acc);
       }
     }

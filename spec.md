@@ -29,28 +29,28 @@ The project is complete when:
 ### Implemented
 
 - **Model:** `BitNet158` transformer — 12 layers, 512 embed dim, 8 heads, RMSNorm + SubLN + GELU, ternary `BitLinear` with STE. Trained to loss 1.04 on TinyStories.
-- **Kernel (v6):** Tiled shared-memory GEMM in `bitnet_forward.cu`. 2-bit weight packing (4 weights per byte), `uint4` vectorized loads, `[K, N]` pre-transposed layout for coalesced access, shared-memory unpacking station, branchless `ISETP+FSEL` accumulation (zero FMUL). Bank-conflict fixes applied (transposed `s_B_unpacked`, padded `s_A`).
+- **Kernel (v6):** Tiled shared-memory GEMM in `bitnet_forward.cu`. W2A8 quantization, native `__dp4a` integer dot-product accumulation, 2-bit weight packing (4 weights per byte), `uint4` vectorized loads, `[K, N]` pre-transposed layout for coalesced access, shared-memory unpacking station, branchless accumulation. Bank-conflict fixes applied (transposed `s_B_unpacked`, padded `s_A`).
 - **Inference pipeline:** `inference.py` (CLI) and `app.py` (Gradio UI) with top-p sampling, repetition penalty, temperature control, streaming generation, and GPU telemetry.
 - **Benchmark harness:** `benchmark_uw.py` and sweep in `test_kernel.py` comparing custom kernel vs cuBLAS FP16/FP32.
 - **Weights:** `BitNet_UW_Final_Gold_1.04.safetensors` — trained independently on a ThinkStation P520.
 - **Kernel Integration:** Custom CUDA kernel successfully integrated into `BitLinear.forward()` (ISSUE-07) and verified matching mathematical correctness across all shapes.
 - **KV Cache:** `past_key_values` caching fully implemented (ISSUE-08) for linear-cost $O(T)$ autoregressive generation, dropping step-cost to $O(1)$ and verified mathematically equivalent to full sequence generation.
+- **`__dp4a` dynamic quantization:** `__dp4a` integer dot-product accumulation (W2A8 quantization) (ISSUE-09) is fully implemented, verified, and test tolerances adjusted in `test_kernel.py`.
 
 ### In Progress
 
-- `__dp4a` integer dot-product accumulation (W2A8 quantization) (ISSUE-09).
+- Register tiling (2D thread-tile accumulation in registers).
 
 ### Not Yet Implemented
 
 - Warp-level shuffle intrinsics to replace `__syncthreads()` barriers.
-- Register tiling (2D thread-tile accumulation in registers).
 - Full unpack-phase thread utilization (currently 16 of 256 threads active during unpack).
 
 ## 5. Current Priority
 
-**`__dp4a` integer dot-product accumulation (W2A8 quantization)**
+**Register tiling (2D thread-tile accumulation in registers)**
 
-Migrate the kernel from float16 activations to 8-bit integer activations (INT8), enabling the use of native GPU `__dp4a` instructions (4-way integer dot-product with 32-bit accumulation). This will replace the float calculations in the inner loop with high-throughput integer arithmetic, breaking through the floating-point instruction throughput limit. This requires adding scaling/quantization layers for activations prior to GEMM.
+Implement 2D thread-tile accumulation in registers to break the shared-memory bandwidth ceiling. This involves having each thread compute and store a small sub-tile of output values in its registers rather than writing to shared memory repeatedly, which increases arithmetic intensity and reduces shared memory access overhead.
 
 ## 6. Non-Goals
 
@@ -72,10 +72,10 @@ Migrate the kernel from float16 activations to 8-bit integer activations (INT8),
 
 ## 8. Long-Term Roadmap
 
-1. **Fix test suite** — correct dimension mismatches and add the memory transpose to `pack_ternary`.
-2. **Kernel integration** — wire `bitnet_cuda.bitnet_forward` into `BitLinear.forward()` for end-to-end inference.
-3. **KV cache** — implement `past_key_values` for linear-cost autoregressive generation.
-4. **`__dp4a` migration** — move to W2A8 quantization with native integer dot-product instructions.
+1. **Fix test suite** — correct dimension mismatches and add the memory transpose to `pack_ternary`. (Completed)
+2. **Kernel integration** — wire `bitnet_cuda.bitnet_forward` into `BitLinear.forward()` for end-to-end inference. (Completed)
+3. **KV cache** — implement `past_key_values` for linear-cost autoregressive generation. (Completed)
+4. **`__dp4a` migration** — move to W2A8 quantization with native integer dot-product instructions. (Completed)
 5. **Register tiling** — 2D thread-tile accumulation in registers to break the shared-memory bandwidth ceiling.
 6. **Warp shuffle intrinsics** — replace `__syncthreads()` with `__shfl_sync()` for intra-warp communication.
 

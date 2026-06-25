@@ -168,7 +168,7 @@ def test_random(M=64, K=128, N=64, seed=42):
     # fp16 accumulation can drift; allow a small absolute tolerance.
     # The kernel accumulates in fp32 but A is stored as fp16, so small
     # representational differences vs. the fp32 reference are expected.
-    atol = 1e-1   # generous for fp16 over K=128 additions
+    atol = 0.25   # accommodate W2A8 quantization noise
     rtol = 1e-2
 
     passed = torch.allclose(C_kernel.cpu(), C_ref, atol=atol, rtol=rtol)
@@ -217,7 +217,7 @@ def test_boundary(M=17, K=128, N=33, seed=7):
     max_err = (C_kernel.cpu() - C_ref).abs().max().item()
     print(f"  Max abs error : {max_err:.6f}")
 
-    if torch.allclose(C_kernel.cpu(), C_ref, atol=1e-1, rtol=1e-2):
+    if torch.allclose(C_kernel.cpu(), C_ref, atol=0.25, rtol=1e-2):
         print("  PASS\n")
     else:
         print("  FAIL — boundary handling is broken\n")

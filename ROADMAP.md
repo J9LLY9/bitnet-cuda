@@ -6,39 +6,27 @@ This file tracks short-term engineering tasks, completed milestones, and immedia
 
 ## 1. Current State (As of June 25, 2026)
 
-* **Status:** W2A8 Quantization and native `__dp4a` hardware math have been implemented!
-  * **PyTorch side (`model.py`):** Added dynamic activation scaling/quantization to `int8`, and output de-quantization back to `float16`.
-  * **CUDA side (`bitnet_forward.cu`):** Replaced the branchless `FSEL` float GEMM loop with a vectorized 32-bit load and 4-way `__dp4a` integer accumulation, resulting in a pure integer pipeline.
+* **Status:** W2A8 Quantization, native `__dp4a` hardware math, and shared-memory packing are fully implemented and verified!
+  * **PyTorch side ([model.py](file:///home/p520/bitnet-cuda/model.py)):** Dynamic activation scaling/quantization to `int8`, and output de-quantization back to `float16` integrated successfully.
+  * **CUDA side ([bitnet_forward.cu](file:///home/p520/bitnet-cuda/bitnet_forward.cu)):** Vectorized 32-bit load and 4-way `__dp4a` integer accumulation inside the inner loop with an optimized shared-memory packing station that bypasses unpacking overhead during accumulation.
   * **Build status:** Compiled and linked successfully on GCC 15 + CUDA 13.
-  * **Correctness:** Verified that KV caching outputs match full sequence outputs 100% identically. The custom integer GEMM matches PyTorch float reference within ~1% average error.
+  * **Correctness:** Correctness verified. [test_kernel.py](file:///home/p520/bitnet-cuda/test_kernel.py) passes all tests with updated absolute tolerance (`atol=0.25`) to accommodate W2A8 integer quantization rounding noise. Interactive text generation ([inference.py](file:///home/p520/bitnet-cuda/inference.py)) runs end-to-end through the kernel.
 
 ---
 
 ## 2. Immediate Blocker (Where We Left Off)
 
-* **Tolerance mismatch in `test_kernel.py`:**
-  * `TEST 2` (Random) and `TEST 3` (Boundary) failed because their tolerances are set to `atol=0.1` (designed for the unquantized float16 kernel).
-  * Because W2A8 quantization introduces a tiny amount of rounding noise (expected ~1% error), the max error was `0.164`.
-  * **Solution:** We need to increase `atol` to `0.25` in those tests.
+* **None.** All outstanding blockers (test tolerance mismatch) have been resolved.
 
 ---
 
 ## 3. Tomorrow's Tasks (In Order)
 
-### **Task 1: Adjust tolerances in test_kernel.py**
-Run the following prompt in Claude Code to apply the fix:
-```text
-Please edit test_kernel.py to adjust the absolute tolerances (atol) in test_random and test_boundary to 0.25 to accommodate the expected W2A8 integer quantization noise.
-```
+### **Task 1: Profile and Analyze Bottlenecks**
+Profile the dynamic W2A8 quantization kernel using Nsight Compute to determine current bottlenecks (memory bandwidth vs. compute instruction limits) now that `__dp4a` is active.
 
-### **Task 2: Verify and Benchmark**
-Run the test suite to verify correctness and see the performance speedup from `__dp4a`:
-```bash
-venv/bin/python test_kernel.py
-```
+### **Task 2: Design Register Tiling Strategy**
+Sketch out the 2D thread-tile layout for register tiling to load sub-tiles of activations and weights into registers, maximizing data reuse and bypassing shared-memory read bandwidth bounds.
 
-### **Task 3: Run Interactive Text Generation**
-Verify that interactive text generation runs correctly using the W2A8 integer pipeline:
-```bash
-venv/bin/python inference.py
-```
+### **Task 3: Implement Register Tiled Kernel**
+Write the v7 kernel in [bitnet_forward.cu](file:///home/p520/bitnet-cuda/bitnet_forward.cu) utilizing register tiling, and integrate it into the test suite and benchmark sweeps.
