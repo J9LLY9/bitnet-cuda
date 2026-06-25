@@ -19,8 +19,11 @@ Architecture flag
   on a different GPU (e.g. sm_75 for Turing, sm_89 for Ada Lovelace).
 """
 
+import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 NVCC_FLAGS = [
     # ── Target GPU ──────────────────────────────────────────────────────────
@@ -35,10 +38,14 @@ NVCC_FLAGS = [
 
     # ── Debug / profiling aids (safe to remove in production) ───────────────
     "-lineinfo",             # embeds source-line info for Nsight / ncu reports
+
+    # ── glibc 2.41+ compat: patched math_functions.h shadows the CUDA one ─
+    "--compiler-bindir=/usr/bin/gcc",
+    "-I" + os.path.join(HERE, "include"),
 ]
 
 CXX_FLAGS = [
-    "/O2",       # MSVC: optimise (Windows); on Linux this would be "-O2"
+    "-O2",
 ]
 
 setup(
@@ -47,6 +54,7 @@ setup(
         CUDAExtension(
             name="bitnet_cuda",
             sources=["bitnet_forward.cu"],
+            include_dirs=[os.path.join(HERE, "include")],
             extra_compile_args={
                 "cxx":  CXX_FLAGS,
                 "nvcc": NVCC_FLAGS,

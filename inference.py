@@ -40,29 +40,27 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 50,
              temperature: float = 1.0, top_p: float = 0.9,
              repetition_penalty: float = 1.3, device: str = "cuda:0") -> str:
     model.eval()
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)  # (1, seq_len)
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        for _ in range(max_new_tokens):
-            logits      = model(input_ids)           # (1, seq_len, vocab_size)
-            next_logits = logits[:, -1, :]           # (1, vocab_size)
+        logits, past_key_values = model(input_ids, use_cache=True)
+        next_logits = logits[:, -1, :]
 
-            # 1. Repetition penalty
+        for _ in range(max_new_tokens):
             if repetition_penalty != 1.0:
                 next_logits = apply_repetition_penalty(next_logits, input_ids, repetition_penalty)
 
-            # 2. Temperature scaling (must come before Top-P so the distribution
-            #    is already sharpened/flattened when we measure probability mass)
             next_logits = next_logits / max(temperature, 1e-6)
-
-            # 3. Nucleus (Top-P) filter
             next_logits = top_p_filter(next_logits, top_p)
 
-            # 4. Sample
             probs      = F.softmax(next_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            input_ids  = torch.cat([input_ids, next_token], dim=1)
 
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+            next_logits, past_key_values = model(
+                next_token, past_key_values=past_key_values, use_cache=True
+            )
+            next_logits = next_logits[:, -1, :]
 
     return tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
 
@@ -118,6 +116,7 @@ if __name__ == "__main__":
                 model.load_state_dict(ckpt, strict=True)
             else:
                 model.load_state_dict(torch.load(weights_path, map_location=device))
+            model.prepare_for_inference()
             print(f"Weights loaded from {weights_path}")
         except RuntimeError as e:
             raise RuntimeError(

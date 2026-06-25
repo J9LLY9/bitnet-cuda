@@ -146,17 +146,20 @@ class BitLinear(nn.Linear):
             if input_dtype != torch.float16:
                 x_flat = x_flat.half()
 
-            pw = self.packed_weights
-            if pw.device != x_flat.device:
-                pw = pw.to(x_flat.device)
+            scale = 127.0 / x_flat.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+            x_quant = (x_flat * scale).round().clamp(-128, 127).to(torch.int8)
 
-            out = BitNetFunction.apply(x_flat, pw, M, self.K_padded, N)
+            pw = self.packed_weights
+            if pw.device != x_quant.device:
+                pw = pw.to(x_quant.device)
+
+            out_int = BitNetFunction.apply(x_quant, pw, M, self.K_padded, N)
 
             gamma = self.weight_gamma
-            if gamma.device != out.device:
-                gamma = gamma.to(out.device)
+            if gamma.device != out_int.device:
+                gamma = gamma.to(out_int.device)
 
-            out = out.to(input_dtype) * gamma
+            out = out_int.to(input_dtype) * (gamma / scale)
             return out.view(*orig_shape[:-1], N)
         else:
             w = self.weight
@@ -182,7 +185,8 @@ class BitAttention(nn.Module):
         self.W_v = BitLinear(embed_size, embed_size)
         self.W_o = BitLinear(embed_size, embed_size)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor,
+                past_key_value=None, use_cache: bool = False):
         B, T, C = x.shape
         H, D    = self.num_heads, self.head_dim
 
@@ -190,13 +194,23 @@ class BitAttention(nn.Module):
         K = self.W_k(x).view(B, T, H, D).transpose(1, 2)
         V = self.W_v(x).view(B, T, H, D).transpose(1, 2)
 
+        if past_key_value is not None:
+            K = torch.cat([past_key_value[0], K], dim=2)
+            V = torch.cat([past_key_value[1], V], dim=2)
+
+        present_key_value = (K, V) if use_cache or past_key_value is not None else None
+
         scale = D ** -0.5
         attn  = (Q @ K.transpose(-2, -1)) * scale
         attn  = attn.masked_fill(mask == 0, float("-inf"))
         attn  = F.softmax(attn, dim=-1)
 
         out = (attn @ V).transpose(1, 2).contiguous().view(B, T, C)
-        return self.W_o(out)
+        out = self.W_o(out)
+
+        if present_key_value is not None:
+            return out, present_key_value
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +225,23 @@ class BitBlock(nn.Module):
         self.ffn_0     = BitLinear(embed_size, 4 * embed_size)
         self.ffn_2     = BitLinear(4 * embed_size, embed_size)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), mask)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor,
+                past_key_value=None, use_cache: bool = False):
+        attn_out = self.attention(self.norm1(x), mask,
+                                 past_key_value=past_key_value,
+                                 use_cache=use_cache)
+
+        if isinstance(attn_out, tuple):
+            attn_out, present_key_value = attn_out
+        else:
+            present_key_value = None
+
+        x = x + attn_out
         h = F.gelu(self.ffn_0(self.norm2(x)))
         x = x + self.ffn_2(h)
+
+        if present_key_value is not None:
+            return x, present_key_value
         return x
 
 
@@ -272,19 +299,39 @@ class BitNet158(nn.Module):
             if isinstance(m, BitLinear):
                 m.pack_for_inference()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, past_key_values=None,
+                use_cache: bool = False):
         B, T = x.shape
-        assert T <= self.max_seq_len, \
-            f"Sequence length {T} exceeds max_seq_len {self.max_seq_len}"
+        past_len = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        total_len = past_len + T
 
-        pos  = torch.arange(T, device=x.device).unsqueeze(0)
-        x    = self.token_embedding(x) + self.pos_embedding(pos)
-        mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
+        assert total_len <= self.max_seq_len, \
+            f"Sequence length {total_len} exceeds max_seq_len {self.max_seq_len}"
 
-        for block in self.blocks:
-            x = block(x, mask)
+        pos = torch.arange(past_len, total_len, device=x.device).unsqueeze(0)
+        x   = self.token_embedding(x) + self.pos_embedding(pos)
+        mask = torch.tril(
+            torch.ones(total_len, total_len, device=x.device)
+        )[past_len:, :].unsqueeze(0).unsqueeze(0)
 
-        return self.lm_head(self.norm(x))
+        present_key_values = [] if use_cache or past_key_values is not None else None
+
+        for i, block in enumerate(self.blocks):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            block_out = block(x, mask, past_key_value=past_kv, use_cache=use_cache)
+
+            if isinstance(block_out, tuple):
+                x, present_kv = block_out
+                if present_key_values is not None:
+                    present_key_values.append(present_kv)
+            else:
+                x = block_out
+
+        logits = self.lm_head(self.norm(x))
+
+        if present_key_values is not None:
+            return logits, present_key_values
+        return logits
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

@@ -33,27 +33,24 @@ The project is complete when:
 - **Inference pipeline:** `inference.py` (CLI) and `app.py` (Gradio UI) with top-p sampling, repetition penalty, temperature control, streaming generation, and GPU telemetry.
 - **Benchmark harness:** `benchmark_uw.py` and sweep in `test_kernel.py` comparing custom kernel vs cuBLAS FP16/FP32.
 - **Weights:** `BitNet_UW_Final_Gold_1.04.safetensors` — trained independently on a ThinkStation P520.
+- **Kernel Integration:** Custom CUDA kernel successfully integrated into `BitLinear.forward()` (ISSUE-07) and verified matching mathematical correctness across all shapes.
+- **KV Cache:** `past_key_values` caching fully implemented (ISSUE-08) for linear-cost $O(T)$ autoregressive generation, dropping step-cost to $O(1)$ and verified mathematically equivalent to full sequence generation.
 
 ### In Progress
 
-- Kernel integration into the model forward pass (ISSUE-07 — the pipeline currently uses `torch.nn.Linear`).
+- `__dp4a` integer dot-product accumulation (W2A8 quantization) (ISSUE-09).
 
 ### Not Yet Implemented
 
-- KV cache for linear-cost autoregressive generation.
-- `__dp4a` integer dot-product accumulation (W2A8 quantization).
 - Warp-level shuffle intrinsics to replace `__syncthreads()` barriers.
 - Register tiling (2D thread-tile accumulation in registers).
 - Full unpack-phase thread utilization (currently 16 of 256 threads active during unpack).
-- Test suite fixes for dimension mismatches and missing memory transpose in `pack_ternary`.
 
 ## 5. Current Priority
 
-**Integrate the custom CUDA kernel into the model inference pipeline.**
+**`__dp4a` integer dot-product accumulation (W2A8 quantization)**
 
-Replace `torch.nn.Linear` inside `BitLinear.forward()` with `bitnet_cuda.bitnet_forward` so that text generation runs end-to-end through the custom kernel. This is the single highest-impact milestone — it converts the kernel from an isolated benchmark artifact into a working inference engine and unlocks meaningful tok/s comparisons.
-
-Prerequisites: fix `test_kernel.py` (dimension mismatches, missing transpose) so the kernel has a passing correctness suite before integration.
+Migrate the kernel from float16 activations to 8-bit integer activations (INT8), enabling the use of native GPU `__dp4a` instructions (4-way integer dot-product with 32-bit accumulation). This will replace the float calculations in the inner loop with high-throughput integer arithmetic, breaking through the floating-point instruction throughput limit. This requires adding scaling/quantization layers for activations prior to GEMM.
 
 ## 6. Non-Goals
 

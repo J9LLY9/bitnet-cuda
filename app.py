@@ -75,6 +75,7 @@ if weights_path is None:
 else:
     try:
         _load_weights(model, weights_path, is_st, device)
+        model.prepare_for_inference()
         print(f"Weights loaded from {weights_path}")
     except RuntimeError as e:
         raise RuntimeError(
@@ -116,10 +117,10 @@ def generate_stream(prompt, max_new_tokens, temperature, top_p, repetition_penal
     t0 = time.perf_counter()
 
     with torch.no_grad():
-        for i in range(int(max_new_tokens)):
-            logits      = model(input_ids)
-            next_logits = logits[:, -1, :]
+        logits, past_key_values = model(input_ids, use_cache=True)
+        next_logits = logits[:, -1, :]
 
+        for i in range(int(max_new_tokens)):
             if repetition_penalty != 1.0:
                 next_logits = apply_repetition_penalty(next_logits, input_ids, repetition_penalty)
 
@@ -130,9 +131,14 @@ def generate_stream(prompt, max_new_tokens, temperature, top_p, repetition_penal
             next_token = torch.multinomial(probs, num_samples=1)
             input_ids  = torch.cat([input_ids, next_token], dim=1)
 
-            elapsed  = time.perf_counter() - t0
-            tps      = (i + 1) / elapsed if elapsed > 0 else 0.0
-            output   = tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
+            next_logits, past_key_values = model(
+                next_token, past_key_values=past_key_values, use_cache=True
+            )
+            next_logits = next_logits[:, -1, :]
+
+            elapsed = time.perf_counter() - t0
+            tps     = (i + 1) / elapsed if elapsed > 0 else 0.0
+            output  = tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
             yield output, tps
 
 

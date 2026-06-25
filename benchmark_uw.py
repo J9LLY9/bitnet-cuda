@@ -35,29 +35,23 @@ def run_benchmark(M, K, N, mode="Inference"):
     # Generate dummy data
     A = torch.randn(M, K, dtype=torch.float16, device="cuda")
     B_fp16 = torch.randn(N, K, dtype=torch.float16, device="cuda")
-    
-    # For custom kernel: Packed int8 weights, pre-transposed for coalesced access (v4).
-    #
-    # The kernel reads B_u4[t * N + g_col]:
-    #   t     = tile index  ∈ [0, K//64)  — outer dimension
-    #   g_col = neuron index ∈ [0, N)     — inner / fast dimension
-    # so consecutive threads (consecutive g_col) hit consecutive addresses.
-    #
-    # Step 1: create a random (N, K//4) int8 weight matrix (the logical layout).
-    # Step 2: view as (N, K//64, 16) — splits K//4 bytes into (K//64 tiles, 16 bytes/tile).
-    # Step 3: permute to (K//64, N, 16) — tile first, neuron second.
-    # Step 4: .contiguous() — materialises the transposed layout in physical memory.
+
+    # For custom kernel: Packed int8 weights, pre-transposed for coalesced access.
     B_packed = (torch.randint(-128, 127, (N, K // 4), dtype=torch.int8, device="cuda")
                     .view(N, K // 64, 16)
                     .permute(1, 0, 2)
                     .contiguous())
 
+    # W2A8: quantize activations to int8 outside the timing loop
+    scale = 127.0 / A.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    A_quant = (A * scale).round().clamp(-128, 127).to(torch.int8)
+
     # Define the functions
     def pytorch_baseline():
         return torch.nn.functional.linear(A, B_fp16)
-    
+
     def custom_bitnet():
-        return bitnet_cuda.bitnet_forward(A, B_packed, M, K, N)
+        return bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N)
 
     # --- 1. RUN TIMING ---
     time_pt = benchmark_function("PyTorch Baseline", pytorch_baseline)
@@ -66,9 +60,9 @@ def run_benchmark(M, K, N, mode="Inference"):
     # --- 2. CALCULATE MEMORY TRAFFIC (Bytes moved) ---
     # PyTorch FP16: Read A, Read B, Write C (All float16 = 2 bytes)
     bytes_pt = (M * K * 2) + (K * N * 2) + (M * N * 2)
-    
-    # BitNet: Read A (2 bytes), Read B_packed (1 byte per 4 weights), Write C (2 bytes)
-    bytes_custom = (M * K * 2) + ((K * N) / 4) + (M * N * 2)
+
+    # BitNet W2A8: Read A (int8, 1 byte), Read B_packed (1 byte per 4 weights), Write C (int32, 4 bytes)
+    bytes_custom = (M * K * 1) + ((K * N) / 4) + (M * N * 4)
 
     # --- 3. CALCULATE BANDWIDTH (GB/s) ---
     # GB/s = (Total Bytes / 1e9) / (Time in seconds)

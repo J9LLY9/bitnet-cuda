@@ -108,7 +108,14 @@ def test_fixed():
                                  [0,  1, -1, 1]], dtype=torch.int8)
     B_packed = apply_kernel_layout(pack_ternary(W_int), N, K).cuda()
 
-    C_kernel = bitnet_cuda.bitnet_forward(A_vals, B_packed, M, K, N)
+    print(f"  [DEBUG] B_packed.shape = {B_packed.shape}")
+    print(f"  [DEBUG] M={M}, K={K}, N={N}")
+    print(f"  [DEBUG] B_packed.dtype is torch.int8: {B_packed.dtype == torch.int8} (actual: {B_packed.dtype})")
+
+    scale = 127.0 / A_vals.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    A_quant = (A_vals * scale).round().clamp(-128, 127).to(torch.int8)
+    C_kernel = bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N)
+    C_kernel = C_kernel.half() / scale
     C_ref    = torch.tensor([[1.0, 3.0]], dtype=torch.float16)
 
     print(f"  Expected : {C_ref}")
@@ -145,8 +152,15 @@ def test_random(M=64, K=128, N=64, seed=42):
     W_float = unpack_ternary(B_packed, K)
     B_packed = apply_kernel_layout(B_packed, N, K).cuda()
 
+    print(f"  [DEBUG] B_packed.shape = {B_packed.shape}")
+    print(f"  [DEBUG] M={M}, K={K}, N={N}")
+    print(f"  [DEBUG] B_packed.dtype is torch.int8: {B_packed.dtype == torch.int8} (actual: {B_packed.dtype})")
+
     # Kernel output
-    C_kernel = bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
+    scale = 127.0 / A_fp16.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    A_quant = (A_fp16 * scale).round().clamp(-128, 127).to(torch.int8)
+    C_kernel = bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N)
+    C_kernel = C_kernel.half() / scale
 
     # Reference: unpack weights, do fp32 matmul, store as fp16
     C_ref   = reference_matmul(A_fp16, W_float)
@@ -190,7 +204,14 @@ def test_boundary(M=17, K=128, N=33, seed=7):
     W_float = unpack_ternary(B_packed, K)
     B_packed = apply_kernel_layout(B_packed, N, K).cuda()
 
-    C_kernel = bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
+    print(f"  [DEBUG] B_packed.shape = {B_packed.shape}")
+    print(f"  [DEBUG] M={M}, K={K}, N={N}")
+    print(f"  [DEBUG] B_packed.dtype is torch.int8: {B_packed.dtype == torch.int8} (actual: {B_packed.dtype})")
+
+    scale = 127.0 / A_fp16.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    A_quant = (A_fp16 * scale).round().clamp(-128, 127).to(torch.int8)
+    C_kernel = bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N)
+    C_kernel = C_kernel.half() / scale
     C_ref    = reference_matmul(A_fp16, W_float)
 
     max_err = (C_kernel.cpu() - C_ref).abs().max().item()
@@ -216,7 +237,13 @@ def test_all_zero_weights(M=16, K=64, N=16):
     W_int    = torch.zeros(N, K, dtype=torch.int8)
     B_packed = apply_kernel_layout(pack_ternary(W_int), N, K).cuda()
 
-    C_kernel = bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
+    print(f"  [DEBUG] B_packed.shape = {B_packed.shape}")
+    print(f"  [DEBUG] M={M}, K={K}, N={N}")
+    print(f"  [DEBUG] B_packed.dtype is torch.int8: {B_packed.dtype == torch.int8} (actual: {B_packed.dtype})")
+
+    scale = 127.0 / A_fp16.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    A_quant = (A_fp16 * scale).round().clamp(-128, 127).to(torch.int8)
+    C_kernel = bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N)
 
     if torch.all(C_kernel == 0):
         print("  PASS\n")
@@ -313,10 +340,13 @@ def benchmark(M: int = 4096, K: int = 4096, N: int = 4096,
 
     ms_torch_fp32 = _cuda_time_ms(run_torch_fp32, n_warmup, n_iters)
 
-    # ── Custom BitNet kernel ─────────────────────────────────────────────────
+    # ── Custom BitNet kernel (W2A8, __dp4a) ────────────────────────────────
+
+    scale = 127.0 / A_fp16.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    A_quant = (A_fp16 * scale).round().clamp(-128, 127).to(torch.int8)
 
     def run_custom():
-        bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N)
+        bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N)
 
     ms_custom = _cuda_time_ms(run_custom, n_warmup, n_iters)
 
@@ -332,9 +362,9 @@ def benchmark(M: int = 4096, K: int = 4096, N: int = 4096,
     speedup_vs_f32 = ms_torch_fp32 / ms_custom
 
     # Memory traffic for the custom kernel (helps assess bandwidth utilisation).
-    bytes_A      = M * K * 2                          # fp16
+    bytes_A      = M * K * 1                          # int8
     bytes_Bpack  = N * (K // 4) * 1                  # int8 packed
-    bytes_C      = M * N * 2                          # fp16
+    bytes_C      = M * N * 4                          # int32
     gb_custom    = (bytes_A + bytes_Bpack + bytes_C) / 1e9
     bw_custom_gbs = gb_custom / (ms_custom * 1e-3)   # GB/s achieved
 
@@ -345,9 +375,9 @@ def benchmark(M: int = 4096, K: int = 4096, N: int = 4096,
     print(f"  {'Custom BitNet (ternary tile)':<30}  {ms_custom:>10.3f}  {tops_cust:>8.2f}  {speedup_vs_f32:>7.2f}x  {speedup_vs_f16:>7.2f}x")
 
     print(f"\n  Memory traffic (custom kernel)")
-    print(f"    A         : {bytes_A   /1e6:6.1f} MB  (fp16, full activation)")
+    print(f"    A         : {bytes_A   /1e6:6.1f} MB  (int8, quantized activation)")
     print(f"    B_packed  : {bytes_Bpack/1e6:6.1f} MB  (int8, 4x compressed vs fp16 dense)")
-    print(f"    C         : {bytes_C   /1e6:6.1f} MB  (fp16 output)")
+    print(f"    C         : {bytes_C   /1e6:6.1f} MB  (int32 output)")
     print(f"    Total     : {gb_custom*1e3:6.1f} MB  →  {bw_custom_gbs:.1f} GB/s achieved")
     print(f"    RTX 3050 peak bandwidth : 112 GB/s")
     print(f"    Bandwidth utilisation   : {100*bw_custom_gbs/112:.1f}%\n")
@@ -387,9 +417,12 @@ def benchmark_sweep() -> None:
 
         iters = 200 if M <= 32 else 50
 
+        scale = 127.0 / A_fp16.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+        A_quant = (A_fp16 * scale).round().clamp(-128, 127).to(torch.int8)
+
         ms_f16  = _cuda_time_ms(lambda: torch.nn.functional.linear(A_fp16, W_f16), 5, iters)
         ms_f32  = _cuda_time_ms(lambda: torch.nn.functional.linear(A_fp32, W_f32), 5, iters)
-        ms_cust = _cuda_time_ms(lambda: bitnet_cuda.bitnet_forward(A_fp16, B_packed, M, K, N), 5, iters)
+        ms_cust = _cuda_time_ms(lambda: bitnet_cuda.bitnet_forward(A_quant, B_packed, M, K, N), 5, iters)
         spd     = ms_f32 / ms_cust
 
         print(f"  {M:>10}  {ms_f16:>10.3f}  {ms_f32:>10.3f}  {ms_cust:>12.3f}  {spd:>14.2f}x")
