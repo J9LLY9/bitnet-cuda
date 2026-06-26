@@ -35,7 +35,7 @@ This file tracks short-term engineering tasks, completed milestones, and immedia
 ## 3. Next Tasks (In Order)
 
 ### **Task 1: Double-Buffered Shared Memory**
-Allocate two ping-pong copies of `s_A` and `s_B_packed` (8 KB → 16 KB per block). While Phase 2 compute runs on the current buffer, asynchronously prefetch the next tile into the alternate buffer. This eliminates the load→compute `__syncthreads()` barrier, replacing it with a lighter async-copy completion fence. Expected tradeoff: 3 blocks per SM (down from 6) vs. fewer stalls.
+Allocate two ping-pong copies of `s_A` and `s_B_packed` (8 KB → 16 KB per block). While Phase 2 compute runs on the current buffer, asynchronously prefetch the next tile into the alternate buffer. This eliminates the load→compute `__syncthreads()` barrier. Expected tradeoff: 6 blocks per SM (down from 8) vs. fewer stalls.
 
 ### **Task 2: Profile v9 vs v8**
 Run `ncu` on both kernels to confirm the decode idle-time reduction is reflected in SM utilization metrics, and to identify whether the remaining `__syncthreads()` barriers or the compute loop is the next bottleneck.

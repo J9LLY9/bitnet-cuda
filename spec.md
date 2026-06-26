@@ -39,14 +39,14 @@ The project is complete when:
 
 ### Not Yet Implemented
 
-- Double-buffered shared memory to pipeline tile loads with compute (eliminate both `__syncthreads()` barriers).
+- Double-buffered shared memory to pipeline tile loads with compute (eliminate one of the two __syncthreads() barriers).
 - Warp-level reductions to further reduce barrier overhead.
 
 ## 5. Current Priority
 
 **Double-buffered shared memory (pipeline tile loads with compute)**
 
-The v9 kernel still issues two `__syncthreads()` barriers per tile step — one after loads and one after compute. Double-buffering `s_A` and `s_B_packed` would allow the next tile's global loads to issue while the current tile's compute runs, hiding global memory latency at the cost of doubling shared memory usage (8 KB → 16 KB per block, reducing occupancy from 6 to 3 blocks per SM).
+The v9 kernel still issues two `__syncthreads()` barriers per tile step — one after loads and one after compute. Double-buffering `s_A` and `s_B_packed` would allow the next tile's global loads to issue while the current tile's compute runs, hiding global memory latency at the cost of doubling shared memory usage (8 KB → 16 KB per block, reducing occupancy from 8 to 6 blocks per SM).
 
 ## 6. Non-Goals
 
