@@ -29,7 +29,7 @@ The project is complete when:
 ### Implemented
 
 - **Model:** `BitNet158` transformer — 12 layers, 512 embed dim, 8 heads, RMSNorm + SubLN + GELU, ternary `BitLinear` with STE. Trained to loss 1.04 on TinyStories.
-- **Kernel (v8):** Register-tiled GEMM in `bitnet_forward.cu`. BM=64, BN=64, BK=64, TM=4, TN=4. Each thread accumulates a 4×4 register sub-tile via an outer product of `a[4] × b[4]`, increasing arithmetic intensity to 8 MACs per shared-memory load (4× over v7). `alignas(16)` shared memory tiles, `uint4` vectorized cooperative loads (all 256 threads for `s_A`; first 64 threads for `s_B_packed`), 100% bank-conflict-free reads. Measured **2.12× faster than fp32 cuBLAS** at M=K=N=4096, 12.32 TOPS on RTX 3050.
+- **Kernel (v9):** Warp-shuffle decoded weight distribution in `bitnet_forward.cu`. Extends v8's register-tiled GEMM (BM=64, BN=64, BK=64, TM=4, TN=4) by involving all 256 threads in the weight decode phase via `__shfl_sync`. 8 warps × 8 columns per warp = 64 columns; lanes 0..7 of each warp issue coalesced LDG loads, then 4 `__shfl_sync` calls broadcast all four `uint4` components to the 24 non-loading lanes. Each of the 256 threads decodes one (chunk, column) pair and writes 4 packed `int32` values to `s_B_packed`, eliminating the 192-thread idle stall of v8. Measured **2.14× faster than fp32 cuBLAS** at M=K=N=4096, 12.34 TOPS on RTX 3050; 1.37× at M=1 (up from 1.31× in v8).
 - **Inference pipeline:** `inference.py` (CLI) and `app.py` (Gradio UI) with top-p sampling, repetition penalty, temperature control, streaming generation, and GPU telemetry.
 - **Benchmark harness:** `benchmark_uw.py` and sweep in `test_kernel.py` comparing custom kernel vs cuBLAS FP16/FP32.
 - **Weights:** `BitNet_UW_Final_Gold_1.04.safetensors` — trained independently on a ThinkStation P520.
@@ -39,14 +39,14 @@ The project is complete when:
 
 ### Not Yet Implemented
 
-- Warp-level shuffle intrinsics to replace `__syncthreads()` barriers.
-- Full unpack-phase thread utilization (currently 64 of 256 threads active during weight unpack).
+- Double-buffered shared memory to pipeline tile loads with compute (eliminate both `__syncthreads()` barriers).
+- Warp-level reductions to further reduce barrier overhead.
 
 ## 5. Current Priority
 
-**Warp shuffle intrinsics (replace `__syncthreads()` with `__shfl_sync()`)**
+**Double-buffered shared memory (pipeline tile loads with compute)**
 
-The v8 kernel uses two `__syncthreads()` barriers per tile step. Replacing intra-warp communication with `__shfl_sync()` eliminates cross-warp synchronization overhead and reduces barrier latency, which is most beneficial for the weight-decode phase where only 64 of 256 threads currently write to shared memory.
+The v9 kernel still issues two `__syncthreads()` barriers per tile step — one after loads and one after compute. Double-buffering `s_A` and `s_B_packed` would allow the next tile's global loads to issue while the current tile's compute runs, hiding global memory latency at the cost of doubling shared memory usage (8 KB → 16 KB per block, reducing occupancy from 6 to 3 blocks per SM).
 
 ## 6. Non-Goals
 
@@ -73,7 +73,8 @@ The v8 kernel uses two `__syncthreads()` barriers per tile step. Replacing intra
 3. **KV cache** — implement `past_key_values` for linear-cost autoregressive generation. (Completed)
 4. **`__dp4a` migration** — move to W2A8 quantization with native integer dot-product instructions. (Completed)
 5. **Register tiling** — 2D thread-tile accumulation in registers to break the shared-memory bandwidth ceiling. (Completed — v8: 2.12× vs fp32 cuBLAS at M=K=N=4096, 12.32 TOPS)
-6. **Warp shuffle intrinsics** — replace `__syncthreads()` with `__shfl_sync()` for intra-warp communication.
+6. **Warp shuffle intrinsics** — replace `__syncthreads()` with `__shfl_sync()` for intra-warp communication. (Completed — v9: 2.14× vs fp32 cuBLAS at M=K=N=4096, 12.34 TOPS; 1.37× at M=1)
+7. **Double-buffered shared memory** — pipeline tile loads with compute to hide global memory latency.
 
 ## 9. Project Organization
 

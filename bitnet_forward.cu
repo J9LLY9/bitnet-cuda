@@ -11,7 +11,7 @@
 typedef float half;
 #endif
 /*
- * bitnet_forward.cu  —  v8: Register-tiled GEMM (BM=64, BN=64, BK=64, TM=4, TN=4)
+ * bitnet_forward.cu  —  v9: Warp-shuffle decoded weight distribution
  *
  * Matrix layout
  * -----------------------------------
@@ -25,51 +25,41 @@ typedef float half;
  *   0b00 →  0    0b01 → +1    0b10 → -1
  *   bits [2b+1 : 2b] hold weight at K-offset b within each packed byte.
  *
- * v8 changes from v7
+ * v9 changes from v8
  * ------------------
- *   v7: 16×16 output tile per block, 1 output element per thread.
- *       Shared-memory bandwidth bound at large batch sizes: each thread
- *       issues 16 shared-memory reads per K-group, giving only 0.5 MACs
- *       per byte read from shared memory.
+ *   v8: Weight decode (Phase 1b) used only the first 64 threads (tid < 64).
+ *       The remaining 192 threads were idle during this phase, creating a
+ *       synchronization stall before Phase 2 could begin.
  *
- *   v8: 64×64 output tile per block, 4×4 output elements per thread.
- *       Each thread accumulates 16 values in registers across the outer
- *       product of a[4] × b[4].  Arithmetic intensity at the shared-memory
- *       level rises to 8 MACs per shared-memory load (4× over v7).
+ *   v9: All 256 threads participate in weight decode via warp-shuffle.
+ *       8 warps × 8 columns per warp = 64 columns (covers the full BN=64 tile).
+ *       Within each warp:
+ *         - Lanes 0..7 each issue one coalesced LDG for their column's uint4.
+ *         - Four __shfl_sync calls (one per uint32 component) broadcast each
+ *           chunk to the 24 non-loading lanes that need it.
+ *         - Each of the 32 lanes decodes one (chunk, column) pair and writes
+ *           4 packed int32 values to s_B_packed.
+ *       The decode work (previously 64 threads × 16 writes = 1024 writes)
+ *       is now spread across 256 threads × 4 writes = 1024 writes with
+ *       all threads active, hiding the __syncthreads() barrier latency better.
  *
- *       Thread mapping (BM=64, BN=64, block=16×16):
- *         Thread (tx, ty) computes C rows {ty, ty+16, ty+32, ty+48}
- *                                    cols {tx, tx+16, tx+32, tx+48}
- *         relative to the block's 64×64 tile origin.
+ *       Why 4 shuffles, not 1:
+ *         A single __shfl_sync(mask, loaded_val, src_lane) reads loaded_val
+ *         from lane src_lane. Since src_lane is always 0..7 (chunk_idx=0),
+ *         a single shuffle only distributes chunk 0 (bw.x). Four separate
+ *         shuffles — one each for bw.x, bw.y, bw.z, bw.w — are required to
+ *         correctly broadcast all four chunks to the 32 lanes of each warp.
  *
- *       Cooperative loads:
- *         s_A[64][64]  — all 256 threads, one uint4 each (fully coalesced).
- *         s_B_packed[16][64] — first 64 threads only (one uint4 = 64 weights).
- *
- *       Bank-conflict analysis:
- *         s_A reads: all threads in a warp share ty → same row → broadcast,
- *                    zero bank conflicts.
- *         s_B reads: s_B_packed[k][tx + 16*j] — tx=0..15 maps to banks 0..15
- *                    (one int32 per bank), no conflict within a warp.
- *
- * Grid / Block dimensions
- * -----------------------
+ * Grid / Block dimensions — unchanged from v8
+ * -------------------------------------------
  *   block = dim3(16, 16) = 256 threads / block
  *   grid  = dim3((N+63)/64, (M+63)/64)
  *
- * Shared memory per block
- * -----------------------
+ * Shared memory per block — unchanged from v8
+ * -------------------------------------------
  *   s_A          : 64 × 64 × 1 B  (int8 activation tile)       = 4096 B
  *   s_B_packed   : 16 × 64 × 4 B  (int32 packed weight tile)   = 4096 B
  *   total                                                       = 8192 B  (8 KB)
- *
- * Theoretical occupancy (GA107 / RTX 3050, Ampere sm_86)
- * -------------------------------------------------------
- *   Shared-memory limit  : 48 KB / 8 KB  =  6 blocks max
- *   Thread limit         : 2048  / 256   =  8 blocks max
- *   → 6 blocks × 256 = 1536 threads = 75% theoretical occupancy
- *     (limited by shared memory, vs v7's thread-limited 100%)
- *     The 4× arithmetic intensity gain outweighs the occupancy drop.
  */
 
 #include <cuda_fp16.h>
@@ -91,6 +81,10 @@ __global__ __launch_bounds__(256, 4) void bitnet_forward_kernel(
   const int tx  = threadIdx.x;
   const int tid = ty * 16 + tx; // 0..255
 
+  // Warp decomposition for the weight decode phase.
+  const int lane_id = tid % 32; // 0..31 within warp
+  const int warp_id = tid / 32; // 0..7  (8 warps per block)
+
   // Shared memory tiles — 16-byte aligned for safe uint4 reinterpret casts.
   alignas(16) __shared__ int8_t  s_A[64][64];        // activation tile
   alignas(16) __shared__ int32_t s_B_packed[16][64]; // packed ternary weight tile
@@ -103,22 +97,20 @@ __global__ __launch_bounds__(256, 4) void bitnet_forward_kernel(
   const uint4 *__restrict__ B_u4 = reinterpret_cast<const uint4 *>(B_packed);
   const int num_tiles = K >> 6; // K / 64
 
-  // Thread roles for cooperative loads:
-  //   s_A:        each of the 256 threads loads one uint4 (16 int8 values).
-  //   s_B_packed: first 64 threads each load one uint4 and decode 64 weights.
-  const int load_row    = tid / 4; // row in s_A this thread fills:  0..63
-  const int load_col_u4 = tid % 4; // uint4 column offset:           0..3
+  // Thread roles for the s_A cooperative load (unchanged from v8):
+  //   Each of the 256 threads loads one uint4 (16 int8 values).
+  const int load_row    = tid / 4; // s_A row this thread fills: 0..63
+  const int load_col_u4 = tid % 4; // uint4 column offset:       0..3
 
   for (int t = 0; t < num_tiles; ++t) {
 
     // ----------------------------------------------------------------
     // Phase 1a — Load activation tile s_A (all 256 threads)
     //
-    // Thread tid loads 16 consecutive int8 values into s_A[load_row][load_col_u4*16 .. +15].
-    // Flattened: reinterpret_cast<uint4*>(s_A)[tid] is byte offset tid*16 in
-    // the 4096-byte tile, which maps exactly to row=tid/4, uint4-col=tid%4.
-    // All threads in a warp have consecutive (load_row, load_col_u4) values,
-    // and consecutive g_col_u4 → consecutive uint4 addresses → coalesced LDG.
+    // Thread tid loads s_A[load_row][load_col_u4*16 .. +15].
+    // Flattened reinterpret: reinterpret_cast<uint4*>(s_A)[tid] maps to
+    // byte offset tid*16, which equals row=tid/4, uint4-col=tid%4. ✓
+    // Consecutive tid values → consecutive g_col_u4 → coalesced LDG.
     // ----------------------------------------------------------------
     {
       const int g_row    = blockIdx.y * 64 + load_row;
@@ -130,42 +122,74 @@ __global__ __launch_bounds__(256, 4) void bitnet_forward_kernel(
     }
 
     // ----------------------------------------------------------------
-    // Phase 1b — Load and unpack weight tile s_B_packed (first 64 threads)
+    // Phase 1b — Load and unpack weight tile s_B_packed (all 256 threads)
     //
-    // Each thread tid (0..63) owns one output column: col_b = blockIdx.x*64 + tid.
-    // It loads the uint4 for (tile t, col_b), then decodes all 64 ternary
-    // weights into 16 packed int32 values stored in s_B_packed[0..15][tid].
-    // Consecutive tid → consecutive col_b → consecutive uint4 addresses
-    // → coalesced LDG across the warp of threads 0..15.
+    // Each warp (warp_id 0..7) is responsible for 8 weight columns:
+    //   columns [warp_id*8 .. warp_id*8+7] of the BN=64 tile.
+    //
+    // Lanes 0..7 of each warp issue one LDG each for their column.
+    // Lanes 8..31 hold bw={0,0,0,0} and receive data via shuffle.
+    //
+    // Shuffle distribution: each lane l is assigned
+    //   chunk_idx = l / 8  (which uint32 chunk of the uint4: 0=.x, 1=.y, 2=.z, 3=.w)
+    //   src_lane  = l % 8  (which loading lane holds the data for this column)
+    //
+    // A single __shfl_sync(mask, loaded_val, src_lane) cannot distribute all
+    // four chunks because loaded_val for any lane in 0..7 always reflects
+    // chunk_idx=0 (i.e., bw.x only). Four component-wise shuffles are used:
+    //   cx = shfl(bw.x, src_lane) — chunk 0 from the source column
+    //   cy = shfl(bw.y, src_lane) — chunk 1 from the source column
+    //   cz = shfl(bw.z, src_lane) — chunk 2 from the source column
+    //   cw = shfl(bw.w, src_lane) — chunk 3 from the source column
+    // Each lane then selects the right cx/cy/cz/cw for its chunk_idx.
+    //
+    // LDG coalescing: lanes 0..7 of each warp access consecutive addresses
+    // → fully coalesced (lanes 0..7 of warp 0 fetch cols 0..7, etc.).
+    //
+    // All 256 threads are active here vs. 64 in v8 → 4× more decode
+    // parallelism and better latency hiding before __syncthreads().
     // ----------------------------------------------------------------
-    if (tid < 64) {
-      const int col_b = blockIdx.x * 64 + tid;
-      const uint4 bw  = (col_b < N)
-          ? __ldg(&B_u4[t * N + col_b])
-          : make_uint4(0u, 0u, 0u, 0u);
+    {
+      // Load: only lanes 0..7 issue LDG; others hold zero.
+      uint4 bw = make_uint4(0u, 0u, 0u, 0u);
+      if (lane_id < 8) {
+        const int col_b = blockIdx.x * 64 + warp_id * 8 + lane_id;
+        bw = (col_b < N) ? __ldg(&B_u4[t * N + col_b])
+                         : make_uint4(0u, 0u, 0u, 0u);
+      }
 
-      // Decode 4 uint32 chunks × 16 ternary codes = 64 weights.
-      // Each group of 4 codes is repacked as one int32 (4 × int8) for __dp4a.
+      // Each lane's role: decode chunk `chunk_idx` of column `src_lane`.
+      const int chunk_idx = lane_id / 8; // 0..3
+      const int src_lane  = lane_id % 8; // 0..7
+
+      // Broadcast all four uint32 components from src_lane to current lane.
+      const uint32_t cx = __shfl_sync(0xFFFFFFFF, bw.x, src_lane);
+      const uint32_t cy = __shfl_sync(0xFFFFFFFF, bw.y, src_lane);
+      const uint32_t cz = __shfl_sync(0xFFFFFFFF, bw.z, src_lane);
+      const uint32_t cw = __shfl_sync(0xFFFFFFFF, bw.w, src_lane);
+
+      // Select the chunk matching this lane's assigned chunk_idx.
+      const uint32_t chunk = (chunk_idx == 0) ? cx
+                           : (chunk_idx == 1) ? cy
+                           : (chunk_idx == 2) ? cz
+                                              : cw;
+
+      // Decode 16 ternary weights from chunk into 4 packed int32 values
+      // and write them to the correct column of s_B_packed.
+      const int col_local = warp_id * 8 + src_lane; // 0..63
 #pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        const uint32_t chunk = (c == 0)   ? bw.x
-                               : (c == 1) ? bw.y
-                               : (c == 2) ? bw.z
-                                          : bw.w;
+      for (int g = 0; g < 4; ++g) {
+        int32_t packed_val = 0;
 #pragma unroll
-        for (int g = 0; g < 4; ++g) {
-          int32_t packed_val = 0;
-#pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            const unsigned code = (chunk >> ((g * 4 + i) * 2)) & 0x3u;
-            // 0b00 → 0, 0b01 → +1, 0b10 → -1
-            int8_t w = (code == 1u) ? (int8_t) 1
-                     : (code == 2u) ? (int8_t)-1
-                                    : (int8_t) 0;
-            packed_val |= ((int32_t)w & 0xFF) << (i * 8);
-          }
-          s_B_packed[c * 4 + g][tid] = packed_val;
+        for (int i = 0; i < 4; ++i) {
+          const unsigned code = (chunk >> ((g * 4 + i) * 2)) & 0x3u;
+          // 0b00 → 0, 0b01 → +1, 0b10 → -1
+          int8_t w = (code == 1u) ? (int8_t) 1
+                   : (code == 2u) ? (int8_t)-1
+                                  : (int8_t) 0;
+          packed_val |= ((int32_t)w & 0xFF) << (i * 8);
         }
+        s_B_packed[chunk_idx * 4 + g][col_local] = packed_val;
       }
     }
 
@@ -179,9 +203,8 @@ __global__ __launch_bounds__(256, 4) void bitnet_forward_kernel(
     //   b[j] = 4 int8 weights   for col (tx + 16*j) of the tile
     //   acc[i][j] += __dp4a(a[i], b[j])
     //
-    // s_A reads: all threads in a warp have the same ty, so all 16 tx
-    //   values read the same address → hardware broadcast, no bank conflict.
-    // s_B_packed reads: tx=0..15 → banks 0..15 (one int32 per bank) → no conflict.
+    // s_A reads: all threads in a warp share ty → same row → broadcast.
+    // s_B reads: tx=0..15 → banks 0..15 (one int32 per bank) → no conflict.
     // ----------------------------------------------------------------
 #pragma unroll
     for (int k = 0; k < 16; ++k) {
@@ -267,9 +290,10 @@ torch::Tensor bitnet_forward(torch::Tensor A,        // (M, K)        int8, CUDA
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bitnet_forward", &bitnet_forward,
-        "BitNet-1.58b W2A8 forward pass (v8, register-tiled, __dp4a).\n"
+        "BitNet-1.58b W2A8 forward pass (v9, warp-shuffle decode, __dp4a).\n"
         "Args: A (M,K int8), B_packed (K/64,N,16 int8 pre-packed), M, K, N -> C (M,N int32)\n"
         "Activations are quantized to int8 in Python; output is int32, de-quantized in Python.\n"
         "Block tile: BM=64, BN=64, BK=64. Thread tile: TM=4, TN=4.\n"
+        "Weight decode: all 256 threads active via 4x __shfl_sync per warp.\n"
         "Requires: K % 64 == 0.");
 }
