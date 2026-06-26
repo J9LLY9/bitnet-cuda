@@ -4,29 +4,38 @@ This file tracks short-term engineering tasks, completed milestones, and immedia
 
 ---
 
-## 1. Current State (As of June 25, 2026)
+## 1. Current State (As of June 26, 2026)
 
-* **Status:** W2A8 Quantization, native `__dp4a` hardware math, and shared-memory packing are fully implemented and verified!
-  * **PyTorch side ([model.py](file:///home/p520/bitnet-cuda/model.py)):** Dynamic activation scaling/quantization to `int8`, and output de-quantization back to `float16` integrated successfully.
-  * **CUDA side ([bitnet_forward.cu](file:///home/p520/bitnet-cuda/bitnet_forward.cu)):** Vectorized 32-bit load and 4-way `__dp4a` integer accumulation inside the inner loop with an optimized shared-memory packing station that bypasses unpacking overhead during accumulation.
-  * **Build status:** Compiled and linked successfully on GCC 15 + CUDA 13.
-  * **Correctness:** Correctness verified. [test_kernel.py](file:///home/p520/bitnet-cuda/test_kernel.py) passes all tests with updated absolute tolerance (`atol=0.25`) to accommodate W2A8 integer quantization rounding noise. Interactive text generation ([inference.py](file:///home/p520/bitnet-cuda/inference.py)) runs end-to-end through the kernel.
+* **Status:** v8 register-tiled kernel is fully implemented, verified, and benchmarked.
+  * **v8 Performance:** The kernel now runs **2.12× faster than fp32 cuBLAS** at M=K=N=4096, achieving **12.32 TOPS** on the RTX 3050. This is a dramatic turnaround from v7, which was 6.55× *slower* than fp32 cuBLAS.
+  * **Design:** BM=64, BN=64, BK=64, TM=4, TN=4. Each of 256 threads computes a 4×4 register sub-tile. Arithmetic intensity at the shared-memory level is 8 MACs per load (4× over v7). `alignas(16)` tiles, `uint4` cooperative loads, 100% bank-conflict-free reads.
+  * **Build & Correctness:** All 4 unit tests pass on GCC 15 + CUDA 13 (RTX 3050 / sm_86).
+
+* **Benchmark sweep (K=N=4096):**
+
+  | M (batch) | fp16 cuBLAS (ms) | fp32 cuBLAS (ms) | Custom v8 (ms) | Speedup vs fp32 |
+  |----------:|----------------:|-----------------:|---------------:|----------------:|
+  |         1 |           0.160 |            0.317 |          0.242 |          1.31×  |
+  |         8 |           0.162 |            0.361 |          0.246 |          1.47×  |
+  |        32 |           0.172 |            0.362 |          0.244 |          1.48×  |
+  |       128 |           0.283 |            0.787 |          0.437 |          1.80×  |
+  |       512 |           0.954 |            2.941 |          1.493 |          1.97×  |
+  |      2048 |           3.568 |           12.042 |          5.672 |          2.12×  |
+  |      4096 |           7.285 |           23.718 |         11.199 |          2.12×  |
 
 ---
 
 ## 2. Immediate Blocker (Where We Left Off)
 
-* **None.** All outstanding blockers (test tolerance mismatch) have been resolved.
+* **None.** v8 is complete. Next step is warp shuffle intrinsics to reduce `__syncthreads()` overhead.
 
 ---
 
-## 3. Tomorrow's Tasks (In Order)
+## 3. Next Tasks (In Order)
 
-### **Task 1: Profile and Analyze Bottlenecks**
-Profile the dynamic W2A8 quantization kernel using Nsight Compute to determine current bottlenecks (memory bandwidth vs. compute instruction limits) now that `__dp4a` is active.
+### **Task 1: Warp Shuffle Intrinsics**
+Replace the two `__syncthreads()` barriers per tile step with `__shfl_sync()` for intra-warp communication. Focus on the weight-decode phase where only 64 of 256 threads write to `s_B_packed` — this is where barrier overhead is highest relative to work done.
 
-### **Task 2: Design Register Tiling Strategy**
-Sketch out the 2D thread-tile layout for register tiling to load sub-tiles of activations and weights into registers, maximizing data reuse and bypassing shared-memory read bandwidth bounds.
+### **Task 2: Profile v8 vs v7**
+Run `ncu` (Nsight Compute) on both kernels to confirm the arithmetic intensity improvement is reflected in SM utilization, and to identify the next bottleneck for v9.
 
-### **Task 3: Implement Register Tiled Kernel**
-Write the v7 kernel in [bitnet_forward.cu](file:///home/p520/bitnet-cuda/bitnet_forward.cu) utilizing register tiling, and integrate it into the test suite and benchmark sweeps.

@@ -29,7 +29,7 @@ The project is complete when:
 ### Implemented
 
 - **Model:** `BitNet158` transformer — 12 layers, 512 embed dim, 8 heads, RMSNorm + SubLN + GELU, ternary `BitLinear` with STE. Trained to loss 1.04 on TinyStories.
-- **Kernel (v6):** Tiled shared-memory GEMM in `bitnet_forward.cu`. W2A8 quantization, native `__dp4a` integer dot-product accumulation, 2-bit weight packing (4 weights per byte), `uint4` vectorized loads, `[K, N]` pre-transposed layout for coalesced access, shared-memory unpacking station, branchless accumulation. Bank-conflict fixes applied (transposed `s_B_unpacked`, padded `s_A`).
+- **Kernel (v8):** Register-tiled GEMM in `bitnet_forward.cu`. BM=64, BN=64, BK=64, TM=4, TN=4. Each thread accumulates a 4×4 register sub-tile via an outer product of `a[4] × b[4]`, increasing arithmetic intensity to 8 MACs per shared-memory load (4× over v7). `alignas(16)` shared memory tiles, `uint4` vectorized cooperative loads (all 256 threads for `s_A`; first 64 threads for `s_B_packed`), 100% bank-conflict-free reads. Measured **2.12× faster than fp32 cuBLAS** at M=K=N=4096, 12.32 TOPS on RTX 3050.
 - **Inference pipeline:** `inference.py` (CLI) and `app.py` (Gradio UI) with top-p sampling, repetition penalty, temperature control, streaming generation, and GPU telemetry.
 - **Benchmark harness:** `benchmark_uw.py` and sweep in `test_kernel.py` comparing custom kernel vs cuBLAS FP16/FP32.
 - **Weights:** `BitNet_UW_Final_Gold_1.04.safetensors` — trained independently on a ThinkStation P520.
@@ -37,20 +37,16 @@ The project is complete when:
 - **KV Cache:** `past_key_values` caching fully implemented (ISSUE-08) for linear-cost $O(T)$ autoregressive generation, dropping step-cost to $O(1)$ and verified mathematically equivalent to full sequence generation.
 - **`__dp4a` dynamic quantization:** `__dp4a` integer dot-product accumulation (W2A8 quantization) (ISSUE-09) is fully implemented, verified, and test tolerances adjusted in `test_kernel.py`.
 
-### In Progress
-
-- Register tiling (2D thread-tile accumulation in registers).
-
 ### Not Yet Implemented
 
 - Warp-level shuffle intrinsics to replace `__syncthreads()` barriers.
-- Full unpack-phase thread utilization (currently 16 of 256 threads active during unpack).
+- Full unpack-phase thread utilization (currently 64 of 256 threads active during weight unpack).
 
 ## 5. Current Priority
 
-**Register tiling (2D thread-tile accumulation in registers)**
+**Warp shuffle intrinsics (replace `__syncthreads()` with `__shfl_sync()`)**
 
-Implement 2D thread-tile accumulation in registers to break the shared-memory bandwidth ceiling. This involves having each thread compute and store a small sub-tile of output values in its registers rather than writing to shared memory repeatedly, which increases arithmetic intensity and reduces shared memory access overhead.
+The v8 kernel uses two `__syncthreads()` barriers per tile step. Replacing intra-warp communication with `__shfl_sync()` eliminates cross-warp synchronization overhead and reduces barrier latency, which is most beneficial for the weight-decode phase where only 64 of 256 threads currently write to shared memory.
 
 ## 6. Non-Goals
 
@@ -76,7 +72,7 @@ Implement 2D thread-tile accumulation in registers to break the shared-memory ba
 2. **Kernel integration** — wire `bitnet_cuda.bitnet_forward` into `BitLinear.forward()` for end-to-end inference. (Completed)
 3. **KV cache** — implement `past_key_values` for linear-cost autoregressive generation. (Completed)
 4. **`__dp4a` migration** — move to W2A8 quantization with native integer dot-product instructions. (Completed)
-5. **Register tiling** — 2D thread-tile accumulation in registers to break the shared-memory bandwidth ceiling.
+5. **Register tiling** — 2D thread-tile accumulation in registers to break the shared-memory bandwidth ceiling. (Completed — v8: 2.12× vs fp32 cuBLAS at M=K=N=4096, 12.32 TOPS)
 6. **Warp shuffle intrinsics** — replace `__syncthreads()` with `__shfl_sync()` for intra-warp communication.
 
 ## 9. Project Organization
