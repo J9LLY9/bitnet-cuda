@@ -7,3 +7,4 @@ venv_p520_new/
 build/
 *.egg-info/
 *.so
+wandb/
