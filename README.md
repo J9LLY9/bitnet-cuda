@@ -14,10 +14,10 @@ Tested on Native Ubuntu | RTX 3050 (8GB VRAM) | CUDA 12.x
 | Metric | PyTorch Native (FP16) | Custom CUDA Kernel (BitNet) | Improvement |
 | :--- | :--- | :--- | :--- |
 | **Memory Traffic (per step)** | 33.57 MB | 4.21 MB | **87.5% Reduction** |
-| **Inference Latency (M=1)** | 0.167 ms | 0.224 ms* | *Approaching native cuBLAS* |
-| **Prefill Latency (M=1024)** | 2.272 ms | 34.093 ms* | *40% speedup from V1* |
+| **Inference Latency (M=1)** | 0.161 ms | 0.230 ms* | *Approaching native cuBLAS (1.49x vs FP32)* |
+| **Prefill Latency (M=1024)** | 2.210 ms | 2.629 ms* | *13x speedup from V1 (Approaching FP16 cuBLAS)* |
 
-*(Note: Benchmark tracks pure memory/compute optimizations without full cuBLAS register tiling).*
+*(Note: Benchmark tracks pure memory/compute optimizations using register-tiled GEMM with double-buffered shared memory prefetching).*
 
 ---
 

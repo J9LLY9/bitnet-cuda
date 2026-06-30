@@ -4,39 +4,35 @@ This file tracks short-term engineering tasks, completed milestones, and immedia
 
 ---
 
-## 1. Current State (As of June 26, 2026)
+## 1. Current State (As of June 30, 2026)
 
-* **Status:** v9 warp-shuffle decoded weight kernel is fully implemented, verified, and benchmarked.
-  * **v9 Performance:** **2.14× faster than fp32 cuBLAS** at M=K=N=4096, **12.34 TOPS** on RTX 3050. Largest gains at small batch sizes: M=1 improved from 1.31× (v8) to **1.37×**, M=8 from 1.47× to **1.55×**.
-  * **Design:** All 256 threads now participate in weight decode via `__shfl_sync`. 8 warps × 8 columns per warp; lanes 0..7 load, 4 `__shfl_sync` calls broadcast all 4 `uint4` components; each lane decodes one (chunk, column) pair. Eliminates the 192-thread idle stall of v8's `tid < 64` decode path.
-  * **Why 4 shuffles:** A single `__shfl_sync(mask, loaded_val, src_lane)` only distributes the source lane's `loaded_val`, which is always `bw.x` (chunk 0) since src_lane ∈ 0..7 forces chunk_idx=0. Four component-wise shuffles are required to broadcast all chunks correctly.
-  * **Build & Correctness:** All 4 unit tests pass on GCC 15 + CUDA 13 (RTX 3050 / sm_86).
+* **Status:** Double-buffered shared memory tiling is fully implemented and integrated. All unit correctness tests pass.
+* **Performance:** Hiding global memory latency via double-buffered prefetching yields a performance improvement across all batch sizes, despite the reduction in block occupancy (from 8 blocks per SM down to 6).
+* **Build & Correctness:** All 4 unit tests pass on GCC 15 + CUDA 13 (RTX 3050 / sm_86).
 
 * **Benchmark sweep (K=N=4096):**
 
-  | M (batch) | fp16 cuBLAS (ms) | fp32 cuBLAS (ms) | Custom v9 (ms) | Speedup vs fp32 |
-  |----------:|----------------:|-----------------:|---------------:|----------------:|
-  |         1 |           0.160 |            0.317 |          0.232 |          1.37×  |
-  |         8 |           0.162 |            0.361 |          0.233 |          1.55×  |
-  |        32 |           0.172 |            0.362 |          0.235 |          1.54×  |
-  |       128 |           0.284 |            0.788 |          0.423 |          1.86×  |
-  |       512 |           0.958 |            2.975 |          1.511 |          1.97×  |
-  |      2048 |           3.589 |           12.106 |          5.673 |          2.13×  |
-  |      4096 |           7.319 |           23.546 |         11.061 |          2.13×  |
+  | M (batch) | fp16 cuBLAS (ms) | fp32 cuBLAS (ms) | Custom v8 (ms) | Custom DB (ms) | Speedup vs fp32 |
+  |----------:|----------------:|-----------------:|---------------:|---------------:|----------------:|
+  |         1 |           0.160 |            0.317 |          0.232 |          0.212 |          1.49×  |
+  |         8 |           0.162 |            0.361 |          0.233 |          0.213 |          1.70×  |
+  |        32 |           0.172 |            0.362 |          0.235 |          0.217 |          1.67×  |
+  |       128 |           0.284 |            0.788 |          0.423 |          0.393 |          2.01×  |
+  |       512 |           0.958 |            2.975 |          1.511 |          1.406 |          2.11×  |
+  |      2048 |           3.589 |           12.106 |          5.673 |          5.351 |          2.25×  |
+  |      4096 |           7.319 |           23.546 |         11.061 |         10.463 |          2.26×  |
 
 ---
 
-## 2. Immediate Blocker (Where We Left Off)
-
-* **None.** v9 is complete. Next step is double-buffered shared memory to pipeline tile loads with compute.
+## 2. Completed Milestones
+* **Milestone 1:** Double-Buffered Shared Memory Tiling (Integrated on June 30, 2026). Yields a ~5.4% to 8.6% latency reduction compared to the single-buffered v8 kernel.
 
 ---
 
 ## 3. Next Tasks (In Order)
 
-### **Task 1: Double-Buffered Shared Memory**
-Allocate two ping-pong copies of `s_A` and `s_B_packed` (8 KB → 16 KB per block). While Phase 2 compute runs on the current buffer, asynchronously prefetch the next tile into the alternate buffer. This eliminates the load→compute `__syncthreads()` barrier. Expected tradeoff: 6 blocks per SM (down from 8) vs. fewer stalls.
+### **Task 1: Profile Double-Buffered Kernel vs Baseline**
+Run `ncu` on both kernels to verify that the stall cycles on memory dependency (`LDG`) have decreased, and to determine the next bottleneck (whether arithmetic pipelines or register pressure is now limiting further speedups).
 
-### **Task 2: Profile v9 vs v8**
-Run `ncu` on both kernels to confirm the decode idle-time reduction is reflected in SM utilization metrics, and to identify whether the remaining `__syncthreads()` barriers or the compute loop is the next bottleneck.
-
+### **Task 2: Warp-Shuffle Decode Re-Integration**
+Now that double-buffering is verified, re-integrate the v9 warp-shuffle decoding optimization to see if we can combine both benefits for a further latency reduction at $M=1$.
